@@ -1,0 +1,7763 @@
+import asyncio
+import os
+import sys
+import time
+import json
+import random
+import logging
+import threading
+from datetime import datetime
+from web3 import Web3
+import requests
+from datetime import datetime, timedelta
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
+from telegram.error import NetworkError, TimedOut
+import aiohttp
+from aiohttp import web
+
+# Konfiguracja logowania
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+
+# --- Token API z zmiennej środowiskowej ---
+TOKEN = os.getenv("BOT_TOKEN")
+if not TOKEN:
+    raise RuntimeError("Missing BOT_TOKEN environment variable! Set it in Replit Secrets.")
+
+# --- BSC Blockchain Configuration ---
+BSC_RPC_URL = os.getenv("BSC_RPC_URL", "https://bsc-dataseed1.binance.org/")
+BSC_API_KEY = os.getenv("BSC_API_KEY")
+DMT_CONTRACT = "0x1fAc48db5079567D8769c9f1c16b228DB435C018"
+DMT_PAIR_ADDRESS = "0x067DEAB2f36aD3c1e267849a1672C1735A788ccf"
+
+# Web3 connection
+try:
+    w3 = Web3(Web3.HTTPProvider(BSC_RPC_URL))
+    if w3.is_connected():
+        logging.info("✅ Połączono z BSC blockchain")
+    else:
+        logging.warning("⚠️ Nie można połączyć z BSC blockchain")
+except Exception as e:
+    logging.error(f"❌ Błąd połączenia BSC: {e}")
+    w3 = None
+
+# --- Baza danych użytkowników ---
+USER_DATA_FILE = "user_data.json"
+
+# === ANTI-BOT PROTECTION ===
+USER_ACTIVITY_LIMITS = {
+    'commands_per_minute': 20,  # Max 20 komend na minutę
+    'points_per_hour': 200,     # Max 200 punktów na godzinę z podstawowych komend
+    'daily_limit': 1000         # Max 1000 punktów dziennie z podstawowych aktywności
+}
+
+def check_rate_limit(user_id, command_type="general"):
+    """Sprawdza czy użytkownik nie przekracza limitów aktywności"""
+    try:
+        user_data = get_user_data_full(user_id)
+        now = time.time()
+
+        # Inicjalizuj tracking jeśli nie istnieje
+        if 'activity_tracking' not in user_data:
+            user_data['activity_tracking'] = {
+                'last_reset': now,
+                'commands_count': 0,
+                'points_earned_hour': 0,
+                'points_earned_day': 0,
+                'last_command_time': 0,
+                'command_intervals': []
+            }
+
+        tracking = user_data['activity_tracking']
+
+        # Reset counters co godzinę
+        if now - tracking.get('last_reset', 0) >= 3600:
+            tracking['points_earned_hour'] = 0
+            tracking['commands_count'] = 0
+            tracking['last_reset'] = now
+            tracking['command_intervals'] = []
+
+        # Reset counters codziennie
+        if now - tracking.get('daily_reset', 0) >= 86400:
+            tracking['points_earned_day'] = 0
+            tracking['daily_reset'] = now
+
+        # Sprawdź interwały między komendami (anti-spam)
+        if tracking['last_command_time'] > 0:
+            interval = now - tracking['last_command_time']
+            if interval < 2:  # Minimalno 2 sekundy między komendami
+                return False, "⏰ Zwolnij! Minimalno 2 sekundy między komendami."
+
+        # Dodaj interwał do listy (ostatnie 10)
+        if len(tracking['command_intervals']) >= 10:
+            tracking['command_intervals'].pop(0)
+        tracking['command_intervals'].append(now - tracking.get('last_command_time', now))
+
+        # Sprawdź czy średni interwał nie jest podejrzanie krótki
+        if len(tracking['command_intervals']) >= 5:
+            avg_interval = sum(tracking['command_intervals']) / len(tracking['command_intervals'])
+            if avg_interval < 3:  # Średnio mniej niż 3 sekundy = podejrzane
+                return False, "🤖 Wykryto podejrzaną aktywność! Zwolnij z komendami."
+
+        # Sprawdź limity
+        if tracking['commands_count'] >= USER_ACTIVITY_LIMITS['commands_per_minute']:
+            return False, f"⏱️ Limit {USER_ACTIVITY_LIMITS['commands_per_minute']} komend/minutę przekroczony!"
+
+        if tracking['points_earned_hour'] >= USER_ACTIVITY_LIMITS['points_per_hour']:
+            return False, f"💎 Limit {USER_ACTIVITY_LIMITS['points_per_hour']} punktów/godzinę przekroczony!"
+
+        if tracking['points_earned_day'] >= USER_ACTIVITY_LIMITS['daily_limit']:
+            return False, f"📅 Dzienny limit {USER_ACTIVITY_LIMITS['daily_limit']} punktów przekroczony!"
+
+        # Aktualizuj countery
+        tracking['commands_count'] += 1
+        tracking['last_command_time'] = now
+
+        update_user_data(user_id, user_data)
+        return True, "OK"
+
+    except Exception as e:
+        logging.error(f"Błąd w rate_limit: {e}")
+        return True, "OK"  # W razie błędu, pozwól kontynuować
+
+def add_points_with_limit(user_id, points):
+    """Dodaje punkty z sprawdzeniem limitów"""
+    try:
+        user_data = get_user_data_full(user_id)
+        tracking = user_data.get('activity_tracking', {})
+
+        # Sprawdź czy nie przekroczy limitów
+        hourly_points = tracking.get('points_earned_hour', 0) + points
+        daily_points = tracking.get('points_earned_day', 0) + points
+
+        if hourly_points > USER_ACTIVITY_LIMITS['points_per_hour']:
+            return get_user_points(user_id), False  # Nie dodawaj punktów
+
+        if daily_points > USER_ACTIVITY_LIMITS['daily_limit']:
+            return get_user_points(user_id), False  # Nie dodawaj punktów
+
+        # Dodaj punkty i aktualizuj tracking
+        final_points = add_points(user_id, points)
+
+        user_data = get_user_data_full(user_id) # Pobierz świeże dane
+        if 'activity_tracking' not in user_data:
+            user_data['activity_tracking'] = {}
+
+        user_data['activity_tracking']['points_earned_hour'] = hourly_points
+        user_data['activity_tracking']['points_earned_day'] = daily_points
+        update_user_data(user_id, user_data)
+
+        return final_points, True
+
+    except Exception as e:
+        logging.error(f"Błąd w add_points_with_limit: {e}")
+        return add_points(user_id, points), True
+
+def load_user_data():
+    """Ultraodporne ładowanie danych"""
+    try:
+        if os.path.exists(USER_DATA_FILE):
+            with open(USER_DATA_FILE, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+                if content:
+                    data = json.loads(content)
+                    # Sprawdź czy dane są poprawne
+                    if isinstance(data, dict):
+                        return data
+                    else:
+                        logging.warning("Nieprawidłowy format danych - resetuję")
+                        return {}
+    except json.JSONDecodeError:
+        logging.warning("Uszkodzony JSON - tworzę nowe dane")
+        # Backup uszkodzonego pliku
+        if os.path.exists(USER_DATA_FILE):
+            try:
+                backup_name = f"{USER_DATA_FILE}.backup.{int(time.time())}"
+                os.rename(USER_DATA_FILE, backup_name)
+                logging.info(f"Backup utworzony: {backup_name}")
+            except:
+                pass
+    except Exception as e:
+        logging.warning(f"Błąd ładowania: {e} - używam pustych danych")
+
+    return {}
+
+def save_user_data(data):
+    """Ultraodporny zapis danych z wieloma zabezpieczeniami"""
+    try:
+        # Sprawdź czy dane są poprawne
+        if not isinstance(data, dict):
+            logging.error("Nieprawidłowe dane do zapisu - pomijam")
+            return
+
+        # Zapisz do tymczasowego pliku z retry
+        for attempt in range(3):
+            try:
+                temp_file = f"{USER_DATA_FILE}.tmp.{attempt}"
+                with open(temp_file, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+
+                # Sprawdź czy plik się zapisał poprawnie
+                with open(temp_file, 'r', encoding='utf-8') as f:
+                    test_data = json.load(f)
+                    if isinstance(test_data, dict):
+                        # Atomowe przeniesienie
+                        os.replace(temp_file, USER_DATA_FILE)
+                        return
+
+            except Exception as e:
+                logging.warning(f"Próba zapisu {attempt+1}/3 nieudana: {e}")
+                if attempt == 2:
+                    logging.error("Wszystkie próby zapisu nieudane!")
+                else:
+                    time.sleep(0.1)  # Krótka przerwa przed kolejną próbą
+
+    except Exception as e:
+        logging.error(f"Krytyczny błąd zapisu: {e}")
+
+def get_user_points(user_id):
+    data = load_user_data()
+    return data.get(str(user_id), {}).get('points', 0)
+
+def add_points(user_id, points):
+    data = load_user_data()
+    if str(user_id) not in data:
+        data[str(user_id)] = {
+            'points': 0, 'badges': [], 'quiz_streak': 0, 'last_daily': None,
+            'pet_level': 1, 'pet_happiness': 50, 'battle_wins': 0, 'mining_level': 1,
+            'mafia_rank': 'Nowicjusz', 'mafia_respect': 0, 'last_heist': 0, 'protection_money': 0,
+            'territory_owned': 0, 'last_mission': 0, 'contracts_completed': 0,
+            'blackjack_wins': 0, 'poker_wins': 0, 'dice_wins': 0
+        }
+    data[str(user_id)]['points'] += points
+    save_user_data(data)
+    return data[str(user_id)]['points']
+
+def get_user_data_full(user_id):
+    data = load_user_data()
+    return data.get(str(user_id), {
+        'points': 0, 'badges': [], 'quiz_streak': 0, 'last_daily': None,
+        'pet_level': 1, 'pet_happiness': 50, 'battle_wins': 0, 'mining_level': 1,
+        'mafia_rank': 'Nowicjusz', 'mafia_respect': 0, 'last_heist': 0, 'protection_money': 0,
+        'territory_owned': 0, 'last_mission': 0, 'contracts_completed': 0,
+        'blackjack_wins': 0, 'poker_wins': 0, 'dice_wins': 0,
+        'recruited_by': None, 'recruited_members': [], 'last_recruitment': 0,
+        'chat_channels': ['rodzina'], 'last_message': 0, 'message_count': 0,
+        'loyalty_bonus': 0, 'special_missions': [], 'special_buildings': [],
+        'rare_minerals_found': {}, 'city_level': 0, 'last_mine_kopalnia_podstawowa': 0,
+        'last_mine_kopalnia_glleboka': 0, 'last_mine_kopalnia_diamentowa': 0,
+        'last_mine_kopalnia_magiczna': 0, 'last_mine_kopalnia_kosmiczna': 0
+    })
+
+def update_user_data(user_id, updates):
+    data = load_user_data()
+    if str(user_id) not in data:
+        data[str(user_id)] = {
+            'points': 0, 'badges': [], 'quiz_streak': 0, 'last_daily': None,
+            'pet_level': 1, 'pet_happiness': 50, 'battle_wins': 0, 'mining_level': 1,
+            'mafia_rank': 'Nowicjusz', 'mafia_respect': 0, 'last_heist': 0, 'protection_money': 0,
+            'territory_owned': 0, 'last_mission': 0, 'contracts_completed': 0,
+            'blackjack_wins': 0, 'poker_wins': 0, 'dice_wins': 0,
+            'recruited_by': None, 'recruited_members': [], 'last_recruitment': 0,
+            'chat_channels': ['rodzina'], 'last_message': 0, 'message_count': 0,
+            'loyalty_bonus': 0, 'special_missions': []
+        }
+    data[str(user_id)].update(updates)
+    save_user_data(data)
+
+# === KEEP-ALIVE SERVER ===
+async def health_check(request):
+    return web.Response(text="Bot is alive!")
+
+def start_keepalive():
+    """Uruchamia keep-alive serwer"""
+    try:
+        app = web.Application()
+        app.router.add_get("/", health_check)
+        app.router.add_get("/health", health_check)
+        web.run_app(app, host="0.0.0.0", port=8080)
+    except Exception as e:
+        logging.error(f"Keep-alive server error: {e}")
+
+# === WATCHDOG ===
+async def auto_check_dmt_purchases():
+    """Automatycznie sprawdza nowe zakupy DMT dla wszystkich połączonych portfeli"""
+    logging.info("💎 Uruchomiono automatyczne sprawdzanie DMT")
+    
+    while True:
+        try:
+            await asyncio.sleep(300)  # Sprawdzaj co 5 minut
+            
+            mappings = load_wallet_mappings()
+            if not mappings:
+                continue
+            
+            data = load_user_data()
+            new_purchases_count = 0
+            
+            for user_id, wallet_address in mappings.items():
+                try:
+                    if user_id in data:
+                        new_dmt, transactions = await process_new_dmt_purchases(int(user_id), wallet_address)
+                        
+                        if new_dmt > 0:
+                            new_purchases_count += len(transactions)
+                            logging.info(f"💎 User {user_id[-4:]}: +{new_dmt:.2f} DMT from {len(transactions)} transactions")
+                
+                except Exception as e:
+                    logging.error(f"Błąd sprawdzania DMT dla {user_id}: {e}")
+                    continue
+            
+            if new_purchases_count > 0:
+                logging.info(f"🎉 Przetworzone nowe zakupy DMT: {new_purchases_count} transakcji")
+        
+        except Exception as e:
+            logging.error(f"Błąd w auto_check_dmt_purchases: {e}")
+            await asyncio.sleep(60)  # Krótka przerwa przy błędzie
+
+async def watchdog():
+    """Watchdog monitorujący stan bota"""
+    count = 0
+    while True:
+        count += 1
+        logging.info(f"🐄 Watchdog #{count} - Bot alive at {time.strftime('%H:%M:%S')}")
+        await asyncio.sleep(120)  # Co 2 minuty
+
+# === SYSTEM MAFII ===
+MAFIA_RANKS = {
+    'Nowicjusz': {'min_respect': 0, 'max_respect': 99, 'bonus': 0},
+    'Żołnierz': {'min_respect': 100, 'max_respect': 299, 'bonus': 5},
+    'Capo': {'min_respect': 300, 'max_respect': 599, 'bonus': 10},
+    'Underboss': {'min_respect': 600, 'max_respect': 999, 'bonus': 20},
+    'Don': {'min_respect': 1000, 'max_respect': float('inf'), 'bonus': 50}
+}
+
+# === MAFIA BOSSES & HIERARCHY ===
+MAFIA_BOSSES = {
+    'don_mleko': {
+        'name': '🐄 Don Mleko',
+        'title': 'Ojciec rodziny',
+        'respect': 999999,
+        'description': 'Legendarny boss wszystkich bossów. Jego mleko daje życie całej rodzinie.',
+        'special_power': 'Może dać każdemu błogosławieństwo +100% do wszystkich nagród'
+    },
+    'bialy_rogacz': {
+        'name': '🤵🐂 Biały Rogacz',
+        'title': 'Prawa ręka Dona',
+        'respect': 50000,
+        'description': 'Potężny biały byk w eleganckim garniturze. Prawa ręka Don Mleko i jego najbardziej zaufany doradca.',
+        'special_power': 'Może werbować nowych członków i dawać specjalne misje'
+    },
+    'krwawa_krowa': {
+        'name': '🩸🐄 Krwawa Krowa',
+        'title': 'Egzekutor rodziny',
+        'respect': 25000,
+        'description': 'Bezlitosny egzekutor, który załatwia "problemy" rodziny.',
+        'special_power': 'Może rozpoczynać wojny między rodzinami'
+    },
+    'mleczny_phantom': {
+        'name': '👻 Milk Phantom',
+        'title': 'Szpieg rodziny',
+        'respect': 20000,
+        'description': 'Niewidzialny szpieg, który zbiera informacje o wrogach.',
+        'special_power': 'Może sprawdzać statystyki innych graczy'
+    }
+}
+
+# === SYSTEM KOMUNIKACJI ===
+CHAT_CHANNELS = {
+    'rodzina': {'name': '👥 Kanał Rodziny', 'min_respect': 0, 'description': 'Główny kanał dla wszystkich członków'},
+    'capo': {'name': '👔 Kanał Capo', 'min_respect': 300, 'description': 'Tylko dla Capo i wyżej'},
+    'underboss': {'name': '🤵 Kanał Underboss', 'min_respect': 600, 'description': 'Tylko dla Underboss i Donów'},
+    'don': {'name': '👑 Kanał Donów', 'min_respect': 1000, 'description': 'Sekretny kanał najwyższych rangą'},
+    'tajny': {'name': '🔒 Tajny Kanał', 'min_respect': 500, 'description': 'Kanał dla zaufanych członków'}
+}
+
+# === SYSTEM DAILY REWARDS ===
+DAILY_REWARDS = {
+    1: {'points': 50, 'bonus': 'Pierwszy dzień!'},
+    2: {'points': 75, 'bonus': '+25% mining na 2h'},
+    3: {'points': 100, 'bonus': 'Rzadki minerał guaranteed'},
+    4: {'points': 125, 'bonus': '+50% gambling na 2h'},
+    5: {'points': 150, 'bonus': 'Skip wszystkich cooldownów'},
+    6: {'points': 200, 'bonus': '+100% respect gain na 4h'},
+    7: {'points': 500, 'bonus': 'MEGA BONUS! +1000 respect'},
+    8: {'points': 75, 'bonus': 'Restart streak'},
+    9: {'points': 100, 'bonus': '+25% mining na 2h'},
+    10: {'points': 125, 'bonus': 'Rzadki minerał guaranteed'},
+    11: {'points': 150, 'bonus': '+50% gambling na 2h'},
+    12: {'points': 175, 'bonus': 'Skip wszystkich cooldownów'},
+    13: {'points': 250, 'bonus': '+100% respect gain na 4h'},
+    14: {'points': 750, 'bonus': 'MEGA BONUS! +2000 respect + mining level up'}
+}
+
+STREAK_MILESTONES = {
+    7: {'title': '🔥 Weekly Warrior', 'reward': 1000, 'respect': 500},
+    14: {'title': '💎 Diamond Streaker', 'reward': 2500, 'respect': 1000},
+    30: {'title': '👑 Monthly Legend', 'reward': 5000, 'respect': 2000},
+    100: {'title': '🌟 Centurion', 'reward': 10000, 'respect': 5000},
+    365: {'title': '🏆 Annual Champion', 'reward': 50000, 'respect': 10000}
+}
+
+# === SYSTEM GILDII ===
+GUILDS_FILE = "guilds_data.json"
+GUILD_LEVELS = {
+    1: {'members_required': 3, 'bonus': 10, 'name': 'Początkująca Rodzina'},
+    2: {'members_required': 5, 'bonus': 20, 'name': 'Rosnąca Rodzina'},
+    3: {'members_required': 8, 'bonus': 35, 'name': 'Silna Rodzina'},
+    4: {'members_required': 12, 'bonus': 50, 'name': 'Potężna Rodzina'},
+    5: {'members_required': 20, 'bonus': 75, 'name': 'Legenda Mafii'},
+    6: {'members_required': 30, 'bonus': 100, 'name': 'Imperium Don Mleko'}
+}
+
+GUILD_MISSIONS = [
+    # PODSTAWOWE MISJE GILDIJNE
+    {
+        'name': 'Patrol Rodziny',
+        'description': 'Patrolujcie dzielnice i zbierajcie informacje - łatwa misja dla nowych gildii',
+        'min_members': 2,
+        'difficulty': 'łatwy',
+        'reward_per_member': (50, 120),
+        'guild_experience': 25,
+        'cooldown': 3600,  # 1 godzina
+        'special_type': 'patrol'
+    },
+    {
+        'name': 'Grupowy Napad',
+        'description': 'Skoordynowany napad na bank - wymaga 3+ członków',
+        'min_members': 3,
+        'difficulty': 'średni',
+        'reward_per_member': (100, 200),
+        'guild_experience': 50,
+        'cooldown': 7200,  # 2 godziny
+        'special_type': 'heist'
+    },
+    {
+        'name': 'Ochrona Sklepów',
+        'description': 'Zapewnijcie ochronę lokalnym biznesom - stabilny dochód',
+        'min_members': 4,
+        'difficulty': 'średni',
+        'reward_per_member': (120, 250),
+        'guild_experience': 75,
+        'cooldown': 10800,  # 3 godziny
+        'special_type': 'protection'
+    },
+    {
+        'name': 'Wojna Gangów',
+        'description': 'Pokonajcie wrogą gildię - wymaga 5+ członków',
+        'min_members': 5,
+        'difficulty': 'trudny',
+        'reward_per_member': (150, 300),
+        'guild_experience': 100,
+        'cooldown': 14400,  # 4 godziny
+        'special_type': 'war'
+    },
+    {
+        'name': 'Przemyt przez Granicę',
+        'description': 'Przemućcie towar przez niestrzeżone przejścia graniczne',
+        'min_members': 6,
+        'difficulty': 'trudny',
+        'reward_per_member': (200, 400),
+        'guild_experience': 150,
+        'cooldown': 18000,  # 5 godzin
+        'special_type': 'smuggling'
+    },
+    {
+        'name': 'Cyber Atak na Konkurencję',
+        'description': 'Zhakujcie systemy wrogich organizacji - wymaga koordynacji',
+        'min_members': 7,
+        'difficulty': 'bardzo trudny',
+        'reward_per_member': (300, 600),
+        'guild_experience': 250,
+        'cooldown': 21600,  # 6 godzin
+        'special_type': 'cyber'
+    },
+    {
+        'name': 'Przejęcie Miasta',
+        'description': 'Zdobądźcie kontrolę nad miastem - wymaga 8+ członków',
+        'min_members': 8,
+        'difficulty': 'bardzo trudny',
+        'reward_per_member': (250, 500),
+        'guild_experience': 200,
+        'cooldown': 28800,  # 8 godzin
+        'special_type': 'conquest'
+    },
+    {
+        'name': 'Kosmiczna Ekspedycja',
+        'description': 'Podbijcie kosmos dla Don Mleko - wymaga 10+ członków',
+        'min_members': 10,
+        'difficulty': 'legendarna',
+        'reward_per_member': (500, 1000),
+        'guild_experience': 500,
+        'cooldown': 86400,  # 24 godziny
+        'special_type': 'space'
+    },
+    {
+        'name': 'Wielki Skok Stulecia',
+        'description': 'Skraźcie główny skarbiec miasta - mega nagrody ale wysokie ryzyko',
+        'min_members': 12,
+        'difficulty': 'ekspert',
+        'reward_per_member': (600, 1200),
+        'guild_experience': 400,
+        'cooldown': 43200,  # 12 godzin
+        'special_type': 'master_heist'
+    },
+    {
+        'name': 'Operacja Don Mleko',
+        'description': 'Specjalna misja zlecona przez samego Don Mleko - tylko dla elit',
+        'min_members': 15,
+        'difficulty': 'mistrzowska',
+        'reward_per_member': (800, 1500),
+        'guild_experience': 600,
+        'cooldown': 64800,  # 18 godzin
+        'special_type': 'don_mission'
+    },
+    {
+        'name': 'Podbój Galaktyki',
+        'description': 'Rozszerzcie imperium Don Mleko na inne planety - ultimate misja',
+        'min_members': 20,
+        'difficulty': 'transcendentna',
+        'reward_per_member': (1000, 2000),
+        'guild_experience': 1000,
+        'cooldown': 172800,  # 48 godzin
+        'special_type': 'galactic'
+    },
+
+    # NOWE SPECJALNE MISJE
+    {
+        'name': 'Misja Rekrutacyjna',
+        'description': 'Zwerbujcie nowych członków do gildii - bonus za każdego nowego gracza',
+        'min_members': 3,
+        'difficulty': 'specjalna',
+        'reward_per_member': (80, 180),
+        'guild_experience': 60,
+        'cooldown': 14400,  # 4 godziny
+        'special_type': 'recruitment'
+    },
+    {
+        'name': 'Turniej Gildii',
+        'description': 'Weźcie udział w turnieju przeciwko innym gildiom - prestiż i nagrody',
+        'min_members': 8,
+        'difficulty': 'turniejowa',
+        'reward_per_member': (300, 700),
+        'guild_experience': 300,
+        'cooldown': 86400,  # 24 godziny
+        'special_type': 'tournament'
+    },
+    {
+        'name': 'Obrona Terytorium',
+        'description': 'Obróńcie swoje terytorium przed atakiem wrogiej gildii',
+        'min_members': 6,
+        'difficulty': 'obronna',
+        'reward_per_member': (200, 450),
+        'guild_experience': 180,
+        'cooldown': 16200,  # 4.5 godziny
+        'special_type': 'defense'
+    },
+
+    # 🔥 NAJNOWSZE MISJE GILDIJNE 2025 🔥
+    {
+        'name': 'Zwiad Terenowy',
+        'description': 'Eksplorujcie nieznane tereny i zbierajcie strategiczne informacje',
+        'min_members': 2,
+        'difficulty': 'łatwy',
+        'reward_per_member': (60, 140),
+        'guild_experience': 30,
+        'cooldown': 5400,  # 1.5 godziny
+        'special_type': 'exploration'
+    },
+    {
+        'name': 'Nocna Infiltracja',
+        'description': 'Stealth mission - wkradnijcie się do wrogiej bazy pod osłoną nocy',
+        'min_members': 4,
+        'difficulty': 'średni',
+        'reward_per_member': (140, 280),
+        'guild_experience': 90,
+        'cooldown': 12600,  # 3.5 godziny
+        'special_type': 'stealth'
+    },
+    {
+        'name': 'Festiwal Don Mleko',
+        'description': 'Zorganizujcie wielki festiwal mleczny - społecznościowa misja',
+        'min_members': 5,
+        'difficulty': 'społecznościowy',
+        'reward_per_member': (180, 350),
+        'guild_experience': 120,
+        'cooldown': 25200,  # 7 godzin
+        'special_type': 'social'
+    },
+    {
+        'name': 'Konwój Mleczny',
+        'description': 'Eskortujcie cenną przesyłkę mleka przez niebezpieczne tereny',
+        'min_members': 6,
+        'difficulty': 'średni',
+        'reward_per_member': (220, 440),
+        'guild_experience': 140,
+        'cooldown': 19800,  # 5.5 godziny
+        'special_type': 'escort'
+    },
+    {
+        'name': 'Dyplomatyczna Misja',
+        'description': 'Negocjujcie sojusz z neutralną frakcją - wymaga finezji',
+        'min_members': 7,
+        'difficulty': 'dyplomatyczny',
+        'reward_per_member': (280, 550),
+        'guild_experience': 170,
+        'cooldown': 28800,  # 8 godzin
+        'special_type': 'diplomacy'
+    },
+    {
+        'name': 'Tajny Eksperyment',
+        'description': 'Przeprowadźcie nielegalne eksperymenty na mleku Don Mleko',
+        'min_members': 8,
+        'difficulty': 'naukowy',
+        'reward_per_member': (320, 640),
+        'guild_experience': 200,
+        'cooldown': 32400,  # 9 godzin
+        'special_type': 'science'
+    },
+    {
+        'name': 'Wielka Operacja MLK',
+        'description': 'Skoordynowana mega operacja - wymaga doskonałej koordynacji',
+        'min_members': 9,
+        'difficulty': 'koordynacyjny',
+        'reward_per_member': (380, 750),
+        'guild_experience': 250,
+        'cooldown': 36000,  # 10 godzin
+        'special_type': 'coordination'
+    },
+    {
+        'name': 'Fabryka Memów',
+        'description': 'Przejmijcie kontrolę nad fabryką memów i produkujcie propaganda',
+        'min_members': 9,
+        'difficulty': 'memowy',
+        'reward_per_member': (400, 800),
+        'guild_experience': 280,
+        'cooldown': 39600,  # 11 godzin
+        'special_type': 'meme_warfare'
+    },
+    {
+        'name': 'Czyściciel Miasta',
+        'description': 'Oczyśćcie miasto z wszystkich wrogów Don Mleko',
+        'min_members': 10,
+        'difficulty': 'czyszczący',
+        'reward_per_member': (450, 900),
+        'guild_experience': 320,
+        'cooldown': 43200,  # 12 godzin
+        'special_type': 'cleansing'
+    },
+    {
+        'name': 'Handel Międzygalaktyczny',
+        'description': 'Nawiążcie handel z obcymi cywilizacjami - kosmiczne zyski',
+        'min_members': 11,
+        'difficulty': 'kosmiczny',
+        'reward_per_member': (500, 1000),
+        'guild_experience': 380,
+        'cooldown': 50400,  # 14 godzin
+        'special_type': 'galactic_trade'
+    },
+    {
+        'name': 'Operacja "Złoty Róg"',
+        'description': 'Epic heist - skradnijcie legendarny Złoty Róg z muzeum',
+        'min_members': 12,
+        'difficulty': 'epicka',
+        'reward_per_member': (600, 1200),
+        'guild_experience': 450,
+        'cooldown': 54000,  # 15 godzin
+        'special_type': 'epic_heist'
+    },
+    {
+        'name': 'Operacja Czasowa',
+        'description': 'Wykorzystajcie portal czasowy do zmiany historii na korzyść Don Mleko',
+        'min_members': 13,
+        'difficulty': 'czasowy',
+        'reward_per_member': (700, 1400),
+        'guild_experience': 520,
+        'cooldown': 64800,  # 18 godzin
+        'special_type': 'time_travel'
+    },
+    {
+        'name': 'Imperium Technologiczne',
+        'description': 'Zbudujcie technologiczne imperium przyszłości',
+        'min_members': 14,
+        'difficulty': 'technologiczny',
+        'reward_per_member': (800, 1600),
+        'guild_experience': 600,
+        'cooldown': 72000,  # 20 godzin
+        'special_type': 'tech_empire'
+    },
+    {
+        'name': 'Bank Centralny',
+        'description': 'Przejmijcie kontrolę nad bankiem centralnym kraju',
+        'min_members': 16,
+        'difficulty': 'finansowy',
+        'reward_per_member': (1000, 2000),
+        'guild_experience': 700,
+        'cooldown': 86400,  # 24 godziny
+        'special_type': 'financial_takeover'
+    },
+    {
+        'name': 'Centrum Klonowania',
+        'description': 'Sklonujcie armię Don Mleko dla światowej dominacji',
+        'min_members': 18,
+        'difficulty': 'genetyczny',
+        'reward_per_member': (1200, 2400),
+        'guild_experience': 800,
+        'cooldown': 108000,  # 30 godzin
+        'special_type': 'cloning'
+    },
+    {
+        'name': 'Obrona Przed Obcymi',
+        'description': 'Obróńcie Ziemię przed inwazją obcych - misja epickiej obrony',
+        'min_members': 18,
+        'difficulty': 'obronny_epic',
+        'reward_per_member': (1300, 2600),
+        'guild_experience': 900,
+        'cooldown': 115200,  # 32 godziny
+        'special_type': 'alien_defense'
+    },
+    {
+        'name': 'Alians Mleczny',
+        'description': 'Stwórzcie potężny alians wszystkich frakcji mlecznych',
+        'min_members': 20,
+        'difficulty': 'ultimate_alliance',
+        'reward_per_member': (1500, 3000),
+        'guild_experience': 1000,
+        'cooldown': 129600,  # 36 godzin
+        'special_type': 'ultimate_alliance'
+    },
+    {
+        'name': 'Wielka Fuzja',
+        'description': 'Połączcie wszystkie gildie w jedno potężne imperium',
+        'min_members': 25,
+        'difficulty': 'mega_fusion',
+        'reward_per_member': (2000, 4000),
+        'guild_experience': 1500,
+        'cooldown': 259200,  # 3 dni
+        'special_type': 'mega_fusion'
+    },
+    {
+        'name': 'Stworzenie Boga',
+        'description': 'Ultimate transcendence - stwórzcie nowego boga z Don Mleko',
+        'min_members': 30,
+        'difficulty': 'transcendentna_ultimate',
+        'reward_per_member': (3000, 6000),
+        'guild_experience': 2000,
+        'cooldown': 432000,  # 5 dni
+        'special_type': 'god_creation'
+    }
+]
+
+# === SYSTEM POLUBIEŃ I KOMENTARZY ===
+POST_TYPES = {
+    'achievement': '🏆 Osiągnięcie',
+    'victory': '⚔️ Zwycięstwo',
+    'jackpot': '💰 Jackpot',
+    'milestone': '🎯 Kamień milowy',
+    'funny': '😂 Zabawne',
+    'help': '❓ Pomoc',
+    'announcement': '📢 Ogłoszenie'
+}
+
+FEED_POSTS_FILE = "social_feed.json"
+COMMENTS_FILE = "post_comments.json"
+LIKES_FILE = "post_likes.json"
+
+MEMY = [
+    "🐄 Don Mleko patrzy... ZAWSZE patrzy! 👀",
+    "💎 HODL jak Don Mleko hodluje mleko! 🥛",
+    "🚀 Do księżyca z Don Mleko! Ale czy księżyc jest gotowy? 🌙",
+    "🐄 Kiedy ktoś sprzedaje DMT:\n'Zdrajca w rodzinie!' - Don Mleko",
+    "💰 Don Mleko: 'Pieniądze nie śpią, ja też nie!' 😴",
+    "🔥 DMT > Bitcoin?\nDon Mleko: 'Oczywiście!' 💪",
+    "🐄 Rodzina Don Mleko nie zapomina!\nAni nie wybacza... papierowym rękom! 📄✋",
+    "🎯 Don Mleko celuje w Mars!\nKsiężyc to tylko przystanek! 🚀",
+    "🥛 Kto nie pije mleka, ten nie zna prawdy! 🐄",
+    "💎 Paper hands detected! Don Mleko disappointed! 😤"
+]
+
+GIFY = [
+    "https://media.giphy.com/media/3o6ZtrbzjGAAXyx2WQ/giphy.gif",
+    "https://media.giphy.com/media/3mb63a43HO7aU/giphy.gif",
+    "https://media.giphy.com/media/Ogak8 프리미엄/giphy.gif",
+    "https://media.giphy.com/media/12QMHpHsOBwQHS/giphy.gif",
+    "https://media.giphy.com/media/YN1eB6slBDeNHr1gjs/giphy.gif",
+    "https://media.giphy.com/media/3o84sq21TxDH6PyYms/giphy.gif",
+    "https://media.giphy.com/media/l41YfykEffZ7QM55m/giphy.gif",
+    "https://media.giphy.com/media/XreQmk7ETCak0/giphy.gif",
+    "https://media.giphy.com/media/cJL1Y7MY1akc8/giphy.gif",
+    "https://media.giphy.com/media/5fBH6zlg2vAokrF4kg/giphy.gif",
+    # Nowe 40 GIFów
+    "https://media.giphy.com/media/3o7abKhOpu0NwenH3O/giphy.gif",
+    "https://media.giphy.com/media/26u4lOMA8JKSnL9Uk/giphy.gif",
+    "https://media.giphy.com/media/3o6Zt4HU9uwXmXSAuI/giphy.gif",
+    "https://media.giphy.com/media/26u4cqiYI30juCOGY/giphy.gif",
+    "https://media.giphy.com/media/3o7aCRloybJlXpNjSU/giphy.gif",
+    "https://media.giphy.com/media/l0HlR4fRU5QtKABlS/giphy.gif",
+    "https://media.giphy.com/media/3o6fJ1BM7R2EBRDnxK/giphy.gif",
+    "https://media.giphy.com/media/26ufc27mjJKjhxJ1m/giphy.gif",
+    "https://media.giphy.com/media/3o6ZsS8GFJKJeJoRQ4/giphy.gif",
+    "https://media.giphy.com/media/l1ughbsd9qXz2s9SE/giphy.gif",
+    "https://media.giphy.com/media/3o6ZtaO9BZHcOjmErm/giphy.gif",
+    "https://media.giphy.com/media/l46Cy1rHbQ92uuLXa/giphy.gif",
+    "https://media.giphy.com/media/26ufc27mjJKjhxJ1m/giphy.gif",
+    "https://media.giphy.com/media/3o6EhTmKVeVWpG0C0E/giphy.gif",
+    "https://media.giphy.com/media/l0HlvtIPzPdt2usKs/giphy.gif",
+    "https://media.giphy.com/media/3o6Zt7L2RhKiub4VgI/giphy.gif",
+    "https://media.giphy.com/media/26u4d7mjJKjhxJ1m/giphy.gif",
+    "https://media.giphy.com/media/3o6ZtjM8fVCQgYjrIQ/giphy.gif",
+    "https://media.giphy.com/media/l0MYOK5QDQz0QcD9S/giphy.gif",
+    "https://media.giphy.com/media/26u4lEf0mpZw4jLAI/giphy.gif",
+    "https://media.giphy.com/media/3o7abA7YOTfKB2KcV2/giphy.gif",
+    "https://media.giphy.com/media/l46CyVqTYdyAzLV5u/giphy.gif",
+    "https://media.giphy.com/media/26FLdAJQEBlIwNh60/giphy.gif",
+    "https://media.giphy.com/media/3o6ZtpJ8iSRZZJa3cI/giphy.gif",
+    "https://media.giphy.com/media/l0HFKDIM9M2Q1sWpW/giphy.gif",
+    "https://media.giphy.com/media/26u4d7mjJKjhxJ1m/giphy.gif",
+    "https://media.giphy.com/media/3o6ZtpuBP9n6mJuLcc/giphy.gif",
+    "https://media.giphy.com/media/l1ugcwVAcPK6QrXVK/giphy.gif",
+    "https://media.giphy.com/media/3o6EhQQQxCZKGOl8Bi/giphy.gif",
+    "https://media.giphy.com/media/l0MYs3fgvJWtE9UJy/giphy.gif",
+    "https://media.giphy.com/media/26u4ez9BtJlR8m5R6/giphy.gif",
+    "https://media.giphy.com/media/3o7abA7YOTfKB2KcV2/giphy.gif",
+    "https://media.giphy.com/media/l46CyVqTYdyAzLV5u/giphy.gif",
+    "https://media.giphy.com/media/26FLdAJQEBlIwNh60/giphy.gif",
+    "https://media.giphy.com/media/3o6ZtpJ8iSRZZJa3cI/giphy.gif",
+    "https://media.giphy.com/media/l0HFKDIM9M2Q1sWpW/giphy.gif",
+    "https://media.giphy.com/media/26u4d7mjJKjhxJ1m/giphy.gif",
+    "https://media.giphy.com/media/3o6ZtpuBP9n6mJuLcc/giphy.gif",
+    "https://media.giphy.com/media/l1ugcwVAcPK6QrXVK/giphy.gif",
+    "https://media.giphy.com/media/3o6EhQQQxCZKGOl8Bi/giphy.gif"
+]
+
+MISSIONS = [
+    {
+        'name': 'Windykacja długów',
+        'description': 'Odzyskaj pieniądze od dłużników',
+        'difficulty': 'łatwy',
+        'reward': (10, 20),
+        'respect': 10,
+        'time_required': 300  # 5 minut
+    },
+    {
+        'name': 'Ochrona biznesu',
+        'description': 'Zapewnij ochronę sklepowi',
+        'difficulty': 'średni',
+        'reward': (20, 40),
+        'respect': 20,
+        'time_required': 600  # 10 minut
+    },
+    {
+        'name': 'Przemyt cigaret',
+        'description': 'Przeszmugluj kontrabandę przez granicę',
+        'difficulty': 'średni',
+        'reward': (30, 50),
+        'respect': 25,
+        'time_required': 900  # 15 minut
+    },
+    {
+        'name': 'Kradzież aut',
+        'description': 'Ukraść luksusowe samochody dla kolekcjonera',
+        'difficulty': 'trudny',
+        'reward': (40, 70),
+        'respect': 30,
+        'time_required': 1200  # 20 minut
+    },
+    {
+        'name': 'Napad na bank',
+        'description': 'Ryzykowny napad z wielką nagrodą',
+        'difficulty': 'trudny',
+        'reward': (60, 100),
+        'respect': 50,
+        'time_required': 1800  # 30 minut
+    },
+    {
+        'name': 'Handel narkotykami',
+        'description': 'Sprzedaj DMT na ulicach miasta',
+        'difficulty': 'trudny',
+        'reward': (80, 120),
+        'respect': 60,
+        'time_required': 2100  # 35 minut
+    },
+    {
+        'name': 'Handel bronią',
+        'description': 'Nielegalna sprzedaż broni',
+        'difficulty': 'bardzo trudny',
+        'reward': (100, 200),
+        'respect': 100,
+        'time_required': 3600  # 1 godzina
+    },
+    {
+        'name': 'Przejęcie terenu',
+        'description': 'Wypędź konkurencyjną rodzinę z dzielnicy',
+        'difficulty': 'bardzo trudny',
+        'reward': (150, 240),
+        'respect': 120,
+        'time_required': 4500  # 1.25h
+    },
+    {
+        'name': 'Zabójstwo na zlecenie',
+        'description': 'Usuń problematycznego świadka',
+        'difficulty': 'ekspert',
+        'reward': (160, 300),
+        'respect': 150,
+        'time_required': 5400  # 1.5h
+    },
+    {
+        'name': 'Cyber atak na konkurencję',
+        'description': 'Zhakuj systemy wrogich rodzin',
+        'difficulty': 'ekspert',
+        'reward': (200, 400),
+        'respect': 200,
+        'time_required': 7200  # 2 godziny
+    },
+    {
+        'name': 'Przejęcie kasyna',
+        'description': 'Przejmij kontrolę nad największym kasynem w mieście',
+        'difficulty': 'legendarna',
+        'reward': (300, 600),
+        'respect': 300,
+        'time_required': 10800  # 3h
+    },
+    {
+        'name': 'Kosmiczna misja DMT',
+        'description': 'Przemycaj DMT przez galaktykę',
+        'difficulty': 'legendarna',
+        'reward': (400, 1000),
+        'respect': 500,
+        'time_required': 14400  # 4 godziny
+    },
+    {
+        'name': 'Infiltracja FBI',
+        'description': 'Wkradnij się do siedziby FBI i zniszcz dowody',
+        'difficulty': 'mityczna',
+        'reward': (1000, 2000),
+        'respect': 1000,
+        'time_required': 21600  # 6 godzin
+    },
+    {
+        'name': 'Kontrola nad miastem',
+        'description': 'Zostań nieoficjalnym władcą miasta',
+        'difficulty': 'mityczna',
+        'reward': (1500, 3000),
+        'respect': 1500,
+        'time_required': 28800  # 8h
+    },
+    {
+        'name': 'Przejęcie kontroli nad internetem',
+        'description': 'Zostań władcą cyfrowego świata',
+        'difficulty': 'boski',
+        'reward': (2000, 5000),
+        'respect': 2500,
+        'time_required': 43200  # 12 godzin
+    },
+    {
+        'name': 'Imperium Don Mleko',
+        'description': 'Zbuduj globalne imperium mleczne',
+        'difficulty': 'transcendentny',
+        'reward': (4000, 10000),
+        'respect': 5000,
+        'time_required': 86400  # 24h
+    },
+]
+
+# === ROZBUDOWANE MIASTO ===
+TERRITORIES = [
+    {'name': 'Dzielnica przemysłowa', 'cost': 500, 'income': 2, 'type': 'przemysł'},
+    {'name': 'Osiedle mieszkaniowe', 'cost': 800, 'income': 4, 'type': 'mieszkania'},
+    {'name': 'Centrum handlowe', 'cost': 1000, 'income': 5, 'type': 'handel'},
+    {'name': 'Dzielnica klubów', 'cost': 1500, 'income': 8, 'type': 'rozrywka'},
+    {'name': 'Port', 'cost': 2000, 'income': 10, 'type': 'transport'},
+    {'name': 'Dzielnica luksusowa', 'cost': 3000, 'income': 15, 'type': 'luksus'},
+    {'name': 'Lotnisko', 'cost': 4000, 'income': 20, 'type': 'transport'},
+    {'name': 'Kasyno', 'cost': 5000, 'income': 30, 'type': 'rozrywka'},
+    {'name': 'Uniwersytet', 'cost': 6000, 'income': 25, 'type': 'edukacja'},
+    {'name': 'Bank miejski', 'cost': 7500, 'income': 40, 'type': 'finanse'},
+    {'name': 'Szpital', 'cost': 9000, 'income': 35, 'type': 'medycyna'},
+    {'name': 'Dzielnica biznesowa', 'cost': 12000, 'income': 60, 'type': 'biznes'},
+    {'name': 'Rafineria mleka', 'cost': 15000, 'income': 80, 'type': 'przemysł'},
+    {'name': 'Dzielnica dyplomatyczna', 'cost': 18000, 'income': 90, 'type': 'polityka'},
+    {'name': 'Imperium medialne', 'cost': 20000, 'income': 100, 'type': 'media'},
+    {'name': 'Wojskowa baza', 'cost': 25000, 'income': 120, 'type': 'wojsko'},
+    {'name': 'Centrum technologiczne', 'cost': 30000, 'income': 150, 'type': 'tech'},
+    {'name': 'Stolica regionu', 'cost': 40000, 'income': 200, 'type': 'region'},
+    {'name': 'Całe miasto', 'cost': 50000, 'income': 250, 'type': 'metropolia'},
+    {'name': 'Całe państwo', 'cost': 100000, 'income': 500, 'type': 'kraj'},
+    # 10 NOWYCH TERYTORII
+    {'name': 'Kosmiczny port', 'cost': 150000, 'income': 600, 'type': 'kosmos'},
+    {'name': 'Fabryka robotów', 'cost': 200000, 'income': 750, 'type': 'technologia'},
+    {'name': 'Wyspy tropikalne', 'cost': 250000, 'income': 800, 'type': 'turystyka'},
+    {'name': 'Podwodne miasto', 'cost': 300000, 'income': 900, 'type': 'futurystyka'},
+    {'name': 'Centrum AI', 'cost': 400000, 'income': 1000, 'type': 'sztuczna_inteligencja'},
+    {'name': 'Stacja orbitalna', 'cost': 500000, 'income': 1200, 'type': 'orbita'},
+    {'name': 'Kolonia księżycowa', 'cost': 750000, 'income': 1500, 'type': 'księżyc'},
+    {'name': 'Baza na Marsie', 'cost': 1000000, 'income': 2000, 'type': 'mars'},
+    {'name': 'Imperium galaktyczne', 'cost': 2000000, 'income': 3000, 'type': 'galaktyka'},
+    {'name': 'Władza nad wszechświatem', 'cost': 5000000, 'income': 5000, 'type': 'uniwersum'}
+]
+
+# === NOWE BUDYNKI SPECJALNE ===
+SPECIAL_BUILDINGS = {
+    'mleczarnia': {
+        'name': '🥛 Mleczarnia Don Mleko',
+        'cost': 3000,
+        'description': 'Produkuje specjalne mleko zwiększające mining o 25%',
+        'bonus_type': 'mining_boost',
+        'bonus_value': 25,
+        'income': 50
+    },
+    'laboratorium': {
+        'name': '🧪 Laboratorium DMT',
+        'cost': 8000,
+        'description': 'Zwiększa szanse na rzadkie minerały o 50%',
+        'bonus_type': 'rare_minerals',
+        'bonus_value': 50,
+        'income': 0
+    },
+    'akademia': {
+        'name': '🎓 Akademia Mafii',
+        'cost': 6000,
+        'description': 'Zwiększa zdobywanie szacunku o 30%',
+        'bonus_type': 'respect_boost',
+        'bonus_value': 30,
+        'income': 0
+    },
+    'skarbiec': {
+        'name': '🏦 Skarbiec Rodziny',
+        'cost': 10000,
+        'description': 'Chroni 50% punktów przed stratą w napadach',
+        'bonus_type': 'protection',
+        'bonus_value': 50,
+        'income': 0
+    },
+    'fabryka_botow': {
+        'name': '🤖 Fabryka Botów',
+        'cost': 25000,
+        'description': 'Automatycznie wykonuje mining co 30 min',
+        'bonus_type': 'auto_mining',
+        'bonus_value': 30,
+        'income': 0
+    },
+    'cyber_centrum': {
+        'name': '💻 Cyber Centrum',
+        'cost': 35000,
+        'description': 'Hackuje konkurencyjne kopalnie - zwiększa wszystkie nagrody o 40%',
+        'bonus_type': 'all_rewards_boost',
+        'bonus_value': 40,
+        'income': 200
+    },
+    'krypto_farma': {
+        'name': '⚡ Krypto Farma',
+        'cost': 50000,
+        'description': 'Mineuje DMT automatycznie - pasywny dochód 500 DMT/h',
+        'bonus_type': 'passive_mining',
+        'bonus_value': 500,
+        'income': 500
+    },
+    'casino_royale': {
+        'name': '🎰 Casino Royale',
+        'cost': 75000,
+        'description': 'Zwiększa wygrane w grach o 100% i daje VIP bonusy',
+        'bonus_type': 'gambling_boost',
+        'bonus_value': 100,
+        'income': 800
+    },
+    'rakieta_don_mleko': {
+        'name': '🚀 Rakieta Don Mleko',
+        'cost': 100000,
+        'description': 'MEGA BOOST! Wszystkie aktywności x2, dostęp do kosmicznych misji',
+        'bonus_type': 'mega_boost',
+        'bonus_value': 200,
+        'income': 1500
+    },
+    'portal_czasowy': {
+        'name': '🌀 Portal Czasowy',
+        'cost': 150000,
+        'description': 'Redukuje wszystkie cooldown\'y o 75% - szybsze działanie!',
+        'bonus_type': 'time_boost',
+        'bonus_value': 75,
+        'income': 2000
+    },
+    'forteca_mleka': {
+        'name': '🏰 Forteca Mleka',
+        'cost': 200000,
+        'description': 'ULTIMATE DEFENSE! 90% ochrona + 3000 DMT/h dochód',
+        'bonus_type': 'ultimate_protection',
+        'bonus_value': 90,
+        'income': 3000
+    },
+    'fabryka_memow': {
+        'name': '😂 Fabryka Memów',
+        'cost': 30000,
+        'description': 'Generuje losowe bonusy i easter eggi - nigdy nie wiesz co dostaniesz!',
+        'bonus_type': 'random_bonus',
+        'bonus_value': 50,
+        'income': 300
+    },
+    'centrum_dowodzenia': {
+        'name': '🎯 Centrum Dowodzenia',
+        'cost': 80000,
+        'description': 'Koordynuje wszystkie operacje - bonus do wszystkich działań +60%',
+        'bonus_type': 'coordination_boost',
+        'bonus_value': 60,
+        'income': 600
+    }
+}
+
+# === ROZSZERZONE MINING ===
+MINING_LOCATIONS = {
+    'kopalnia_podstawowa': {
+        'name': '⛏️ Kopalnia Podstawowa',
+        'unlock_level': 1,
+        'success_rate': 70,
+        'base_reward': (1, 5),
+        'cooldown': 300,  # 5 minut
+        'rare_chance': 0,
+        'description': 'Podstawowa kopalnia dla początkujących'
+    },
+    'kopalnia_glleboka': {
+        'name': '🕳️ Kopalnia Głęboka',
+        'unlock_level': 5,
+        'success_rate': 60,
+        'base_reward': (3, 10),
+        'cooldown': 600,  # 10 minut
+        'rare_chance': 5,
+        'description': 'Głębsza kopalnia z lepszymi nagrodami'
+    },
+    'kopalnia_diamentowa': {
+        'name': '💎 Kopalnia Diamentowa',
+        'unlock_level': 10,
+        'success_rate': 50,
+        'base_reward': (5, 20),
+        'cooldown': 900,  # 15 minut
+        'rare_chance': 10,
+        'description': 'Kopalnia z diamentami i klejnotami'
+    },
+    'kopalnia_magiczna': {
+        'name': '🌟 Kopalnia Magiczna',
+        'unlock_level': 15,
+        'success_rate': 40,
+        'base_reward': (10, 50),
+        'cooldown': 1200,  # 20 minut
+        'rare_chance': 15,
+        'description': 'Magiczna kopalnia z legendarnymi minerałami'
+    },
+    'kopalnia_kosmiczna': {
+        'name': '🚀 Kopalnia Kosmiczna',
+        'unlock_level': 20,
+        'success_rate': 30,
+        'base_reward': (20, 100),
+        'cooldown': 1800,  # 30 minut
+        'rare_chance': 25,
+        'description': 'Kosmiczna kopalnia z meteorytem DMT'
+    }
+}
+
+RARE_MINERALS = {
+    'krysztal_mleka': {
+        'name': '🔮 Kryształ Mleka',
+        'value': 100,
+        'chance': 5,
+        'description': 'Rzadki kryształ pełen mocy Don Mleko'
+    },
+    'diament_dmt': {
+        'name': '💠 Diament DMT',
+        'value': 250,
+        'chance': 3,
+        'description': 'Legendarny diament z czystego DMT'
+    },
+    'meteoryt_kosmiczny': {
+        'name': '☄️ Meteoryt Kosmiczny',
+        'value': 500,
+        'chance': 1,
+        'description': 'Meteoryt z kosmosu pełen tajemniczej energii'
+    },
+    'esencja_dona': {
+        'name': '🌟 Esencja Dona',
+        'value': 1000,
+        'chance': 0.5,
+        'description': 'Najrzadsza esencja zawierająca moc samego Don Mleko'
+    },
+    'neutronium_dmt': {
+        'name': '⚛️ Neutronium DMT',
+        'value': 2000,
+        'chance': 0.3,
+        'description': 'Ultra rzadki mineral z jądra neutronowej gwiazdy'
+    },
+    'czasoprzestrzen_krysztal': {
+        'name': '🌌 Kryształ Czasoprzestrzeni',
+        'value': 5000,
+        'chance': 0.1,
+        'description': 'Kryształ łamiący prawa fizyki - daje bonusy czasowe'
+    },
+    'mleko_boskie': {
+        'name': '🥛✨ Mleko Boskie',
+        'value': 10000,
+        'chance': 0.05,
+        'description': 'Legendarne mleko z najwyższych sfer - ultimate power!'
+    },
+    'rdzen_uniwersum': {
+        'name': '🌠 Rdzeń Uniwersum',
+        'value': 25000,
+        'chance': 0.01,
+        'description': 'Fragment z początku czasów - nieskończona moc!'
+    },
+    'dna_don_mleko': {
+        'name': '🧬 DNA Don Mleko',
+        'value': 50000,
+        'chance': 0.005,
+        'description': 'Genetyczny materiał samego Don Mleko - ultimate evolution!'
+    }
+}
+
+BADGES = {
+    "newbie": {"name": "🐄 Nowy w rodzinie", "desc": "Pierwsze kroki z Don Mleko"},
+    "active": {"name": "⚡ Aktywny członek", "desc": "50+ punktów"},
+    "quiz_master": {"name": "🧠 Mistrz quizów", "desc": "10 poprawnych odpowiedzi"},
+    "hodler": {"name": "💎 Diamond Hands", "desc": "100+ punktów"},
+    "legend": {"name": "👑 Legenda rodziny", "desc": "500+ punktów"},
+    "daily_warrior": {"name": "🔥 Wojownik codziennych zadań", "desc": "7 dni z rzędu daily"},
+    "weekly_legend": {"name": "📅 Tygodniowa Legenda", "desc": "14 dni streak"},
+    "monthly_champion": {"name": "🏆 Mistrz Miesiąca", "desc": "30 dni streak"},
+    "annual_hero": {"name": "👑 Bohater Roku", "desc": "365 dni streak"},
+    "pet_lover": {"name": "🐕 Miłośnik zwierząt", "desc": "Pet na poziomie 10"},
+    "battle_champion": {"name": "⚔️ Mistrz bitew", "desc": "10 wygranych bitew"},
+    "miner": {"name": "⛏️ Górnik DMT", "desc": "Mining na poziomie 5"},
+    "dmtb_finder": {"name": "🌟 DMTB Finder", "desc": "Wykopał legendarny DMTB! (1:1,000,000)"},
+    "mafia_boss": {"name": "🤵 Boss mafii", "desc": "Osiągnięto rangę Don"},
+    "heist_master": {"name": "💰 Mistrz napadów", "desc": "10 udanych napadów"},
+    "territory_king": {"name": "🏰 Król terytorium", "desc": "Posiada 3+ terytorium"},
+    "gambler": {"name": "🎰 Hazardzista", "desc": "Wygraj w 3 różnych grach"},
+    "contract_killer": {"name": "🔫 Zabójca kontraktowy", "desc": "5 wykonanych kontraktów"},
+    "recruiter": {"name": "👥 Rekruter", "desc": "Zwerbował 5 nowych członków"},
+    "social_butterfly": {"name": "💬 Społeczność", "desc": "Wysłał 50 wiadomości na czacie"},
+    "loyal_member": {"name": "🤝 Lojalny członek", "desc": "30 dni w rodzinie"},
+    "don_mleko_blessed": {"name": "🐄 Błogosławiony przez Dona", "desc": "Specjalne błogosławieństwo od Don Mleko"},
+    "guild_founder": {"name": "🏛️ Założyciel Gildii", "desc": "Założył własną gildię"},
+    "guild_leader": {"name": "👑 Lider Gildii", "desc": "Prowadzi silną gildię"},
+    "guild_veteran": {"name": "🛡️ Weteran Gildii", "desc": "Uczestniczył w 10+ misjach gildijnych"},
+    "guild_master": {"name": "🏆 Mistrz Gildii", "desc": "Doprowadził gildię do poziomu 5+"},
+    "dmt_investor": {"name": "💎 DMT Investor", "desc": "Prawdziwy inwestor DMT na BSC blockchain"},
+    "whale_investor": {"name": "🐋 DMT Whale", "desc": "Posiada 100+ DMT na blockchain"},
+    "diamond_holder": {"name": "💠 Diamond Holder", "desc": "HODLuje DMT przez 30+ dni"}
+}
+
+# === FUNKCJE MAFII ===
+
+async def mafia_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.effective_user.id
+        user_data = get_user_data_full(user_id)
+
+        respect = user_data.get('mafia_respect', 0)
+        rank = get_mafia_rank(respect)
+
+        keyboard = [
+            [InlineKeyboardButton("🎯 Misje", callback_data="missions")],
+            [InlineKeyboardButton("🏰 Terytorium", callback_data="territory")],
+            [InlineKeyboardButton("💰 Napad", callback_data="heist")],
+            [InlineKeyboardButton("🛡️ Haracze", callback_data="protection")],
+            [InlineKeyboardButton("👥 Werbowanie", callback_data="recruitment"), InlineKeyboardButton("💬 Czat", callback_data="chat")],
+            [InlineKeyboardButton("🎲 Gry Mafii", callback_data="mafia_games")],
+            [InlineKeyboardButton("👑 Bossowie", callback_data="bosses")],
+            [InlineKeyboardButton("📊 Status mafii", callback_data="mafia_status")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await update.message.reply_text(
+            f"🤵 **RODZINA MAFII DON MLEKO**\n\n"
+            f"👤 Twoja ranga: **{rank}**\n"
+            f"⭐ Szacunek: {respect}\n"
+            f"💰 Bonus za rangę: +{MAFIA_RANKS[rank]['bonus']}%\n\n"
+            f"🎯 Wybierz akcję:",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logging.error(f"Błąd w mafia_menu: {e}")
+        await update.message.reply_text("❌ Błąd w menu mafii!")
+
+def get_mafia_rank(respect):
+    for rank, data in MAFIA_RANKS.items():
+        if data['min_respect'] <= respect <= data['max_respect']:
+            return rank
+    return 'Nowicjusz'
+
+async def missions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.effective_user.id
+        user_data = get_user_data_full(user_id)
+
+        last_mission = user_data.get('last_mission', 0)
+        now = time.time()
+
+        if now - last_mission < 1800:  # 30 minut cooldown
+            remaining = int(1800 - (now - last_mission))
+            await update.message.reply_text(f"⏰ Następna misja za {remaining//60}m {remaining%60}s!")
+            return
+
+        if not context.args:
+            missions_text = "🎯 **DOSTĘPNE MISJE MAFII:**\n\n"
+            for i, mission in enumerate(MISSIONS, 1):
+                missions_text += (
+                    f"{i}. **{mission['name']}** ({mission['difficulty']})\n"
+                    f"   📝 {mission['description']}\n"
+                    f"   💰 Nagroda: {mission['reward'][0]}-{mission['reward'][1]} DMT\n"
+                    f"   ⭐ Szacunek: +{mission['respect']}\n"
+                    f"   ⏱️ Czas: {mission['time_required']//60} min\n\n"
+                )
+            missions_text += "Użyj: `/missions [numer]` aby wybrać misję"
+            await update.message.reply_text(missions_text, parse_mode='Markdown')
+            return
+
+        try:
+            mission_id = int(context.args[0]) - 1
+            if mission_id < 0 or mission_id >= len(MISSIONS):
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ Podaj prawidłowy numer misji!")
+            return
+
+        mission = MISSIONS[mission_id]
+
+        # Sprawdź szanse powodzenia - ensure mafia_respect exists
+        respect = user_data.get('mafia_respect', 0)
+        if 'mafia_respect' not in user_data:
+            user_data['mafia_respect'] = 0
+            respect = 0
+
+        rank = get_mafia_rank(respect)
+        success_bonus = MAFIA_RANKS[rank]['bonus']
+
+        base_chance = {
+            'łatwy': 80,
+            'średni': 60,
+            'trudny': 40,
+            'bardzo trudny': 20
+        }
+
+        success_chance = min(95, base_chance[mission['difficulty']] + success_bonus)
+        result = random.randint(1, 100)
+
+        if result <= success_chance:
+            # Sukces!
+            reward = random.randint(*mission['reward'])
+            respect_gain = mission['respect']
+
+            points = add_points(user_id, reward)
+
+            # Sprawdź odznaki
+            # Sprawdź odznaki
+            if user_data['contracts_completed'] >= 5:
+                check_and_award_badge(user_id, "contract_killer")
+
+            new_rank = get_mafia_rank(user_data['mafia_respect'])
+
+            if new_rank == 'Don':
+                check_and_award_badge(user_id, "mafia_boss")
+
+            rank_text = f"\n🎉 AWANS! Nowa ranga: **{new_rank}**!" if new_rank != old_rank else ""
+
+            await update.message.reply_text(
+                f"✅ **MISJA UDANA!**\n\n"
+                f"🎯 {mission['name']}\n"
+                f"💰 Nagroda: +{reward} DMT\n"
+                f"⭐ Szacunek: +{respect_gain}\n"
+                f"💎 Łącznie punktów: {points}{rank_text}\n\n"
+                f"👤 Ranga: {new_rank} (szacunek: {user_data['mafia_respect']})"
+            )
+        else:
+            # Porażka
+            user_data['last_mission'] = now
+            update_user_data(user_id, user_data)
+
+            await update.message.reply_text(
+                f"💀 **MISJA NIEUDANA!**\n\n"
+                f"🎯 {mission['name']}\n"
+                f"😵 Zostałeś przyłapany przez policję!\n"
+                f"⚠️ Szansa powodzenia była: {success_chance}%\n\n"
+                f"⏰ Spróbuj ponownie za 30 minut!"
+            )
+    except Exception as e:
+        logging.error(f"Błąd w missions: {e}")
+        await update.message.reply_text("❌ Błąd w misjach!")
+
+async def heist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.effective_user.id
+        user_data = get_user_data_full(user_id)
+
+        last_heist = user_data.get('last_heist', 0)
+        now = time.time()
+
+        if now - last_heist < 3600:  # 1 godzina cooldown
+            remaining = int(3600 - (now - last_heist))
+            await update.message.reply_text(f"⏰ Następny napad za {remaining//60}m {remaining%60}s!")
+            return
+
+        # Koszt napadu
+        cost = 100
+        if user_data.get('points', 0) < cost:
+            await update.message.reply_text(f"❌ Potrzebujesz {cost} DMT na przygotowanie napadu!")
+            return
+
+        add_points(user_id, -cost)
+
+        # Szanse powodzenia
+        respect = user_data.get('mafia_respect', 0)
+        rank = get_mafia_rank(respect)
+        base_chance = 30 + MAFIA_RANKS[rank]['bonus']
+
+        if random.randint(1, 100) <= base_chance:
+            # Udany napad!
+            jackpot = random.randint(500, 2000)
+            points = add_points(user_id, jackpot)
+
+            heist_user_data = get_user_data_full(user_id)
+            heist_user_data['last_heist'] = now
+            heist_user_data['mafia_respect'] += 75
+            heist_count = heist_user_data.get('heist_count', 0) + 1
+            heist_user_data['heist_count'] = heist_count
+
+            update_user_data(user_id, heist_user_data)
+
+            if heist_count >= 10:
+                check_and_award_badge(user_id, "heist_master")
+
+            await update.message.reply_text(
+                f"💰 **NAPAD UDANY!**\n\n"
+                f"🏦 Ukradłeś: {jackpot} DMT!\n"
+                f"⭐ Szacunek: +75\n"
+                f"💎 Łącznie punktów: {points}\n"
+                f"🎯 Udane napady: {heist_count}\n\n"
+                f"🚨 Uwaga! Policja Cię szuka!"
+            )
+        else:
+            # Nieudany napad
+            user_data['last_heist'] = now
+            update_user_data(user_id, user_data)
+
+            await update.message.reply_text(
+                f"🚨 **NAPAD NIEUDANY!**\n\n"
+                f"👮 Zostałeś przyłapany przez policję!\n"
+                f"💸 Stracone przygotowania: {cost} DMT\n"
+                f"⚠️ Szansa była: {base_chance}%\n\n"
+                f"⏰ Następny napad za 1 godzinę!"
+            )
+    except Exception as e:
+        logging.error(f"Błąd w heist: {e}")
+        await update.message.reply_text("❌ Błąd w napadzie!")
+
+# === NOWE MINI GRY ===
+
+async def blackjack(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.effective_user.id
+
+        if not context.args:
+            await update.message.reply_text(
+                "🃏 **BLACKJACK DON MLEKO**\n\n"
+                "Cel: Uzyskaj 21 lub blisko 21, ale nie przekrocz!\n"
+                "Użycie: `/blackjack [stawka]`\n\n"
+                "🎯 Minimalna stawka: 10 DMT\n"
+                "🎯 Maksymalna stawka: 200 DMT"
+            )
+            return
+
+        try:
+            bet = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("❌ Stawka musi być liczbą!")
+            return
+
+        if bet < 10 or bet > 200:
+            await update.message.reply_text("❌ Stawka musi być między 10 a 200 DMT!")
+            return
+
+        points = get_user_points(user_id)
+        if points < bet:
+            await update.message.reply_text("❌ Nie masz wystarczająco DMT!")
+            return
+
+        add_points(user_id, -bet)
+
+        # Gra
+        deck = list(range(1, 14)) * 4  # 1-13, 4 kolory
+        random.shuffle(deck)
+
+        player_cards = [deck.pop(), deck.pop()]
+        dealer_cards = [deck.pop(), deck.pop()]
+
+        def card_value(cards):
+            value = 0
+            aces = 0
+            for card in cards:
+                if card > 10:
+                    value += 10
+                elif card == 1:
+                    aces += 1
+                    value += 11
+                else:
+                    value += card
+
+            while value > 21 and aces > 0:
+                value -= 10
+                aces -= 1
+            return value
+
+        def card_name(card):
+            names = {1: 'A', 11: 'J', 12: 'Q', 13: 'K'}
+            return names.get(card, str(card))
+
+        player_value = card_value(player_cards)
+        dealer_value = card_value([dealer_cards[0]])  # Tylko pierwsza karta
+
+        # Sprawdź blackjack
+        if player_value == 21:
+            win = int(bet * 2.5)
+            final_points = add_points(user_id, win)
+
+            user_data = get_user_data_full(user_id)
+            user_data['blackjack_wins'] = user_data.get('blackjack_wins', 0) + 1
+            update_user_data(user_id, user_data)
+
+            await update.message.reply_text(
+                f"🃏 **BLACKJACK!** 🎉\n\n"
+                f"Twoje karty: {' '.join(card_name(c) for c in player_cards)} (21)\n"
+                f"💰 Wygrana: {win} DMT (x2.5)\n"
+                f"💎 Masz teraz: {final_points} DMT"
+            )
+            return
+
+        # Dealer ma blackjack
+        if card_value(dealer_cards) == 21:
+            await update.message.reply_text(
+                f"💀 Dealer ma BLACKJACK!\n\n"
+                f"Twoje karty: {' '.join(card_name(c) for c in player_cards)} ({player_value})\n"
+                f"Dealer: {' '.join(card_name(c) for c in dealer_cards)} (21)\n"
+                f"💸 Przegrałeś: {bet} DMT"
+            )
+            return
+
+        # Normalna gra - dealer dobiera do 17
+        dealer_full_value = card_value(dealer_cards)
+        while dealer_full_value < 17:
+            dealer_cards.append(deck.pop())
+            dealer_full_value = card_value(dealer_cards)
+
+        # Sprawdź wynik
+        if dealer_full_value > 21:
+            # Dealer przekroczył
+            win = bet * 2
+            final_points = add_points(user_id, win)
+            result = "🎉 WYGRANA! Dealer przekroczył 21!"
+        elif player_value > dealer_full_value:
+            # Gracz wygrywa
+            win = bet * 2
+            final_points = add_points(user_id, win)
+            result = "🎉 WYGRANA! Wyższa ręka!"
+        elif player_value == dealer_full_value:
+            # Remis
+            final_points = add_points(user_id, bet)
+            result = "🤝 REMIS! Zwrot stawki"
+        else:
+            # Dealer wygrywa
+            final_points = get_user_points(user_id)
+            result = "💀 PRZEGRANA!"
+
+        if 'win' in locals():
+            user_data = get_user_data_full(user_id)
+            user_data['blackjack_wins'] = user_data.get('blackjack_wins', 0) + 1
+            update_user_data(user_id, user_data)
+
+        await update.message.reply_text(
+            f"🃏 **BLACKJACK WYNIK**\n\n"
+            f"Twoje karty: {' '.join(card_name(c) for c in player_cards)} ({player_value})\n"
+            f"Dealer: {' '.join(card_name(c) for c in dealer_cards)} ({dealer_full_value})\n\n"
+            f"{result}\n"
+            f"💎 Masz teraz: {final_points} DMT"
+        )
+
+    except Exception as e:
+        logging.error(f"Błąd w blackjack: {e}")
+        await update.message.reply_text("❌ Błąd w blackjack!")
+
+async def dice_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.effective_user.id
+
+        if not context.args or len(context.args) != 2:
+            await update.message.reply_text(
+                "🎲 **GRA W KOŚCI DON MLEKO**\n\n"
+                "Zgadnij sumę dwóch kości!\n"
+                "Użycie: `/dice [stawka] [suma]`\n\n"
+                "🎯 Suma: 2-12\n"
+                "🎯 Stawka: 5-100 DMT\n\n"
+                "💰 **Wypłaty:**\n"
+                "• 7 (najczęstsza): x4\n"
+                "• 6,8: x5\n"
+                "• 5,9: x6\n"
+                "• 4,10: x8\n"
+                "• 3,11: x10\n"
+                "• 2,12 (najrzadsza): x15"
+            )
+            return
+
+        try:
+            bet = int(context.args[0])
+            guess = int(context.args[1])
+        except ValueError:
+            await update.message.reply_text("❌ Stawka i suma muszą być liczbami!")
+            return
+
+        if bet < 5 or bet > 100:
+            await update.message.reply_text("❌ Stawka musi być między 5 a 100 DMT!")
+            return
+
+        if guess < 2 or guess > 12:
+            await update.message.reply_text("❌ Suma musi być między 2 a 12!")
+            return
+
+        points = get_user_points(user_id)
+        if points < bet:
+            await update.message.reply_text("❌ Nie masz wystarczająco DMT!")
+            return
+
+        add_points(user_id, -bet)
+
+        # Rzut kośćmi
+        dice1 = random.randint(1, 6)
+        dice2 = random.randint(1, 6)
+        total = dice1 + dice2
+
+        # Wypłaty
+        multipliers = {
+            2: 15, 3: 10, 4: 8, 5: 6, 6: 5, 7: 4,
+            8: 5, 9: 6, 10: 8, 11: 10, 12: 15
+        }
+
+        if total == guess:
+            win = bet * multipliers[guess]
+            final_points = add_points(user_id, win)
+
+            user_data = get_user_data_full(user_id)
+            user_data['dice_wins'] = user_data.get('dice_wins', 0) + 1
+            update_user_data(user_id, user_data)
+
+            await update.message.reply_text(
+                f"🎲 **TRAFIONE!** 🎉\n\n"
+                f"🎯 Wypadło: {dice1} + {dice2} = {total}\n"
+                f"💡 Twoja prognoza: {guess}\n"
+                f"💰 Wygrana: {win} DMT (x{multipliers[guess]})\n"
+                f"💎 Masz teraz: {final_points} DMT"
+            )
+        else:
+            final_points = get_user_points(user_id)
+            await update.message.reply_text(
+                f"🎲 **NIETRAFIONE!** 💀\n\n"
+                f"🎯 Wypadło: {dice1} + {dice2} = {total}\n"
+                f"💡 Twoja prognoza: {guess}\n"
+                f"💸 Stracone: {bet} DMT\n"
+                f"💎 Masz teraz: {final_points} DMT"
+            )
+
+    except Exception as e:
+        logging.error(f"Błąd w dice_game: {e}")
+        await update.message.reply_text("❌ Błąd w grze w kości!")
+
+async def crash_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.effective_user.id
+
+        if not context.args or len(context.args) != 2:
+            await update.message.reply_text(
+                "🚀 **CRASH GAME DON MLEKO**\n\n"
+                "Rakieta leci w górę! Kiedy się zatrzyma?\n"
+                "Użycie: `/crash [stawka] [multiplier]`\n\n"
+                "🎯 Stawka: 10-200 DMT\n"
+                "🎯 Multiplier: 1.1x - 10.0x\n\n"
+                "📈 Im wyższy multiplier, tym większe ryzyko!\n"
+                "🌙 Jeśli rakieta doleci do Twojego multiplikatora,\n"
+                "    wygrywasz stawkę x multiplier!"
+            )
+            return
+
+        try:
+            bet = int(context.args[0])
+            target_multi = float(context.args[1])
+        except ValueError:
+            await update.message.reply_text("❌ Sprawdź format: [stawka] [multiplier]!")
+            return
+
+        if bet < 10 or bet > 200:
+            await update.message.reply_text("❌ Stawka musi być między 10 a 200 DMT!")
+            return
+
+        if target_multi < 1.1 or target_multi > 10.0:
+            await update.message.reply_text("❌ Multiplier musi być między 1.1x a 10.0x!")
+            return
+
+        points = get_user_points(user_id)
+        if points < bet:
+            await update.message.reply_text("❌ Nie masz wystarczająco DMT!")
+            return
+
+        add_points(user_id, -bet)
+
+        # Symulacja crash
+        crash_point = round(random.uniform(1.0, 15.0), 2)
+
+        if crash_point >= target_multi:
+            # Wygrana!
+            win = int(bet * target_multi)
+            final_points = add_points(user_id, win)
+
+            await update.message.reply_text(
+                f"🚀 **RAKIETA DOTARŁA!** 🌙\n\n"
+                f"🎯 Twój cel: {target_multi}x\n"
+                f"📈 Rakieta dotarła do: {crash_point}x\n"
+                f"💰 Wygrana: {win} DMT\n"
+                f"💎 Masz teraz: {final_points} DMT"
+            )
+        else:
+            # Przegrana
+            final_points = get_user_points(user_id)
+            await update.message.reply_text(
+                f"💥 **RAKIETA SPADŁA!** 💀\n\n"
+                f"🎯 Twój cel: {target_multi}x\n"
+                f"📉 Rakieta spadła na: {crash_point}x\n"
+                f"💸 Stracone: {bet} DMT\n"
+                f"💎 Masz teraz: {final_points} DMT"
+            )
+
+    except Exception as e:
+        logging.error(f"Błąd w crash_game: {e}")
+        await update.message.reply_text("❌ Błąd w crash game!")
+
+async def wheel_of_fortune(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.effective_user.id
+
+        if not context.args:
+            await update.message.reply_text(
+                "🎡 **KOŁO FORTUNY DON MLEKO**\n\n"
+                "Zakręć kołem i zobacz co wypadnie!\n"
+                "Użycie: `/wheel [stawka]`\n\n"
+                "🎯 Stawka: 20-150 DMT\n\n"
+                "🎁 **NAGRODY:**\n"
+                "💎 JACKPOT (1%) - x20\n"
+                "🚀 DMT TO MOON (5%) - x10\n"
+                "💰 Duża wygrana (10%) - x5\n"
+                "🥛 Don Mleko (15%) - x3\n"
+                "🐄 Krowa (25%) - x2\n"
+                "😢 Nic (44%) - x0\n\n"
+                "🐄 **Don Mleko zawsze nagradza!**"
+            )
+            return
+
+        try:
+            bet = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("❌ Stawka musi być liczbą!")
+            return
+
+        if bet < 20 or bet > 150:
+            await update.message.reply_text("❌ Stawka musi być między 20 a 150 DMT!")
+            return
+
+        points = get_user_points(user_id)
+        if points < bet:
+            await update.message.reply_text("❌ Nie masz wystarczająco DMT!")
+            return
+
+        add_points(user_id, -bet)
+
+        # Koło fortuny
+        wheel_options = [
+            {"name": "💎 JACKPOT", "chance": 1, "multiplier": 20, "emoji": "💎"},
+            {"name": "🚀 DMT TO MOON", "chance": 5, "multiplier": 10, "emoji": "🚀"},
+            {"name": "💰 Duża wygrana", "chance": 10, "multiplier": 5, "emoji": "💰"},
+            {"name": "🥛 Don Mleko", "chance": 15, "multiplier": 3, "emoji": "🥛"},
+            {"name": "🐄 Krowa", "chance": 25, "multiplier": 2, "emoji": "🐄"},
+            {"name": "😢 Nic", "chance": 44, "multiplier": 0, "emoji": "😢"}
+        ]
+
+        rand = random.randint(1, 100)
+        cumulative = 0
+
+        for option in wheel_options:
+            cumulative += option["chance"]
+            if rand <= cumulative:
+                result = option
+                break
+
+        if result["multiplier"] > 0:
+            win = bet * result["multiplier"]
+            final_points = add_points(user_id, win)
+
+            await update.message.reply_text(
+                f"🎡 **KOŁO FORTUNY** 🎉\n\n"
+                f"🎯 Wypadło: {result['name']}\n"
+                f"🎊 Animacja: {result['emoji']}{result['emoji']}{result['emoji']}\n"
+                f"💰 Wygrana: {win} DMT (x{result['multiplier']})\n"
+                f"💎 Masz teraz: {final_points} DMT"
+            )
+        else:
+            final_points = get_user_points(user_id)
+            await update.message.reply_text(
+                f"🎡 **KOŁO FORTUNY** 💀\n\n"
+                f"🎯 Wypadło: {result['name']}\n"
+                f"😢 Nic nie wygrałeś tym razem!\n"
+                f"💸 Stracone: {bet} DMT\n"
+                f"💎 Masz teraz: {final_points} DMT"
+            )
+
+    except Exception as e:
+        logging.error(f"Błąd w wheel_of_fortune: {e}")
+        await update.message.reply_text("❌ Błąd w kole fortuny!")
+
+# === SYSTEM WERBOWANIA ===
+
+def can_recruit(user_id):
+    """Sprawdza czy użytkownik może werbować"""
+    user_data = get_user_data_full(user_id)
+    respect = user_data.get('mafia_respect', 0)
+    rank = get_mafia_rank(respect)
+    return rank in ['Capo', 'Underboss', 'Don'] or respect >= 300
+
+def get_recruitment_bonus(recruiter_rank):
+    """Bonus za werbowanie w zależności od rangi"""
+    bonuses = {
+        'Capo': 50,
+        'Underboss': 100,
+        'Don': 200
+    }
+    return bonuses.get(recruiter_rank, 25)
+
+def add_to_chat_channel(user_id, channel):
+    """Dodaje użytkownika do kanału czatu"""
+    user_data = get_user_data_full(user_id)
+    channels = user_data.get('chat_channels', ['rodzina'])
+    if channel not in channels:
+        channels.append(channel)
+        update_user_data(user_id, {'chat_channels': channels})
+        return True
+    return False
+
+def can_access_channel(user_id, channel):
+    """Sprawdza czy użytkownik ma dostęp do kanału"""
+    if channel not in CHAT_CHANNELS:
+        return False
+
+    user_data = get_user_data_full(user_id)
+    user_respect = user_data.get('mafia_respect', 0)
+    required_respect = CHAT_CHANNELS[channel]['min_respect']
+
+    return user_respect >= required_respect
+
+async def recruit_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.effective_user.id
+        user_data = get_user_data_full(user_id)
+
+        if not can_recruit(user_id):
+            await update.message.reply_text("❌ Musisz być przynajmniej Capo aby werbować nowych członków!")
+            return
+
+        if not context.args:
+            recruited = user_data.get('recruited_members', [])
+            recruiter_rank = get_mafia_rank(user_data.get('mafia_respect', 0))
+            bonus = get_recruitment_bonus(recruiter_rank)
+
+            await update.message.reply_text(
+                f"👥 **SYSTEM WERBOWANIA MAFII**\n\n"
+                f"👤 Twoja ranga: {recruiter_rank}\n"
+                f"💰 Bonus za werbowanie: {bonus} DMT\n"
+                f"🎯 Zwerbowani przez Ciebie: {len(recruited)}\n\n"
+                f"**INSTRUKCJA:**\n"
+                f"1. Nowy gracz musi użyć: `/recruit [twój_username]`\n"
+                f"2. Otrzymasz bonus za każdego nowego członka\n"
+                f"3. Twoi podopieczni dostają specjalne misje\n\n"
+                f"**TWÓJ KOD WERBUNKOWY:**\n"
+                f"`{update.effective_user.username or user_id}`\n\n"
+                f"👑 **HIERARCHIA WERBOWANIA:**\n"
+                f"🐄 Don Mleko → 🦌 Biały Rogacz → Donowie → Underboss → Capo",
+                parse_mode='Markdown'
+            )
+            return
+
+        # Kod werbunkowy został podany - próba werbowania
+        recruiter_code = context.args[0]
+        data = load_user_data()
+
+        # Znajdź rekrutera
+        recruiter_id = None
+        for uid, udata in data.items():
+            username = None
+            try:
+                chat_member = await update.get_bot().get_chat(uid)
+                username = chat_member.username
+            except:
+                pass
+
+            if username == recruiter_code or uid == recruiter_code:
+                recruiter_id = uid
+                break
+
+        if not recruiter_id or not can_recruit(int(recruiter_id)):
+            await update.message.reply_text("❌ Nieprawidłowy kod werbunkowy lub rekruter nie ma uprawnień!")
+            return
+
+        if user_data.get('recruited_by'):
+            await update.message.reply_text("❌ Już zostałeś zwerbowany przez kogoś innego!")
+            return
+
+        # Werbowanie!
+        recruiter_data = get_user_data_full(int(recruiter_id))
+        recruiter_rank = get_mafia_rank(recruiter_data.get('mafia_respect', 0))
+        bonus = get_recruitment_bonus(recruiter_rank)
+
+        # Aktualizuj dane rekrutera
+        recruited_list = recruiter_data.get('recruited_members', [])
+        recruited_list.append(str(user_id))
+        update_user_data(int(recruiter_id), {
+            'recruited_members': recruited_list,
+            'last_recruitment': time.time()
+        })
+        add_points(int(recruiter_id), bonus)
+
+        # Aktualizuj dane nowego członka
+        starting_bonus = 25 + (bonus // 2)
+        update_user_data(user_id, {
+            'recruited_by': recruiter_id,
+            'mafia_respect': 25,
+            'chat_channels': ['rodzina']
+        })
+        add_points(user_id, starting_bonus)
+
+        await update.message.reply_text(
+            f"🎉 **ZOSTAŁEŚ ZWERBOWANY!**\n\n"
+            f"👤 Zwerbowany przez: {recruiter_rank}\n"
+            f"💰 Bonus startowy: +{starting_bonus} DMT\n"
+            f"⭐ Szacunek startowy: +25\n"
+            f"📱 Dostęp do kanału rodziny\n\n"
+            f"🤵 Witaj w rodzinie Don Mleko!"
+        )
+
+        # Powiadom rekrutera
+        try:
+            await update.get_bot().send_message(
+                chat_id=int(recruiter_id),
+                text=f"🎉 **NOWY REKRUT!**\n\n"
+                     f"👤 Zwerbowałeś nowego członka!\n"
+                     f"💰 Bonus: +{bonus} DMT\n"
+                     f"🎯 Łącznie zwerbowanych: {len(recruited_list)}"
+            )
+        except:
+            pass
+
+    except Exception as e:
+        logging.error(f"Błąd w recruit_member: {e}")
+        await update.message.reply_text("❌ Błąd w systemie werbowania!")
+
+async def chat_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.effective_user.id
+        user_data = get_user_data_full(user_id)
+
+        if not context.args:
+            # Pokaż dostępne kanały
+            channels_text = "💬 **KANAŁY RODZINY DON MLEKO:**\n\n"
+            user_channels = user_data.get('chat_channels', ['rodzina'])
+
+            for channel, info in CHAT_CHANNELS.items():
+                if can_access_channel(user_id, channel):
+                    status = "✅" if channel in user_channels else "🔓"
+                    channels_text += f"{status} {info['name']}\n"
+                    channels_text += f"   📝 {info['description']}\n\n"
+                else:
+                    channels_text += f"🔒 {info['name']} (wymagane: {info['min_respect']} szacunek)\n\n"
+
+            channels_text += (
+                "**INSTRUKCJA:**\n"
+                "📝 `/chat [kanał] [wiadomość]` - wyślij wiadomość\n"
+                "👀 `/chat [kanał]` - zobacz ostatnie wiadomości\n\n"
+                "**DOSTĘPNE KANAŁY:**\n"
+                "rodzina, capo, underboss, don, tajny"
+            )
+
+            await update.message.reply_text(channels_text, parse_mode='Markdown')
+            return
+
+        channel = context.args[0].lower()
+
+        if channel not in CHAT_CHANNELS:
+            await update.message.reply_text("❌ Nieznany kanał! Dostępne: rodzina, capo, underboss, don, tajny")
+            return
+
+        if not can_access_channel(user_id, channel):
+            required = CHAT_CHANNELS[channel]['min_respect']
+            await update.message.reply_text(f"❌ Brak dostępu! Wymagane: {required} szacunek")
+            return
+
+        if len(context.args) == 1:
+            # Pokaż ostatnie wiadomości
+            messages = load_chat_messages(channel)
+            if not messages:
+                await update.message.reply_text(f"💬 Kanał {CHAT_CHANNELS[channel]['name']} jest pusty")
+                return
+
+            messages_text = f"💬 **{CHAT_CHANNELS[channel]['name']}** (ostatnie 10):\n\n"
+            for msg in messages[-10:]:
+                time_str = datetime.fromtimestamp(msg['timestamp']).strftime("%H:%M")
+                messages_text += f"[{time_str}] **{msg['username']}**: {msg['message']}\n"
+
+            await update.message.reply_text(messages_text, parse_mode='Markdown')
+            return
+
+        # Wyślij wiadomość
+        message = ' '.join(context.args[1:])
+        if len(message) > 200:
+            await update.message.reply_text("❌ Wiadomość za długa! Maksymalnie 200 znaków.")
+            return
+
+        username = update.effective_user.first_name or f"Członek#{str(user_id)[-4:]}"
+        save_chat_message(channel, user_id, username, message)
+
+        # Aktualizuj statystyki użytkownika
+        user_data['message_count'] = user_data.get('message_count', 0) + 1
+        user_data['last_message'] = time.time()
+        update_user_data(user_id, user_data)
+
+        await update.message.reply_text(
+            f"✅ Wiadomość wysłana na kanał {CHAT_CHANNELS[channel]['name']}!"
+        )
+
+    except Exception as e:
+        logging.error(f"Błąd w chat_system: {e}")
+        await update.message.reply_text("❌ Błąd w systemie czatu!")
+
+def load_chat_messages(channel):
+    """Ładuje wiadomości z kanału"""
+    try:
+        filename = f"chat_{channel}.json"
+        if os.path.exists(filename):
+            with open(filename, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except:
+        pass
+    return []
+
+def save_chat_message(channel, user_id, username, message):
+    """Zapisuje wiadomość do kanału"""
+    try:
+        messages = load_chat_messages(channel)
+
+        new_message = {
+            'user_id': str(user_id),
+            'username': username,
+            'message': message,
+            'timestamp': time.time()
+        }
+
+        messages.append(new_message)
+
+        # Zachowaj tylko ostatnie 100 wiadomości
+        if len(messages) > 100:
+            messages = messages[-100:]
+
+        filename = f"chat_{channel}.json"
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(messages, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.error(f"Błąd zapisywania wiadomości: {e}")
+
+# === FUNKCJE GILDII ===
+
+def load_guilds_data():
+    """Ładuje dane gildii"""
+    try:
+        if os.path.exists(GUILDS_FILE):
+            with open(GUILDS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except:
+        pass
+    return {}
+
+def save_guilds_data(guilds_data):
+    """Zapisuje dane gildii"""
+    try:
+        with open(GUILDS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(guilds_data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.error(f"Błąd zapisywania gildii: {e}")
+
+def get_user_guild(user_id):
+    """Pobiera gildię użytkownika"""
+    guilds_data = load_guilds_data()
+    for guild_id, guild in guilds_data.items():
+        if str(user_id) in guild.get('members', []):
+            return guild_id, guild
+    return None, None
+
+def get_guild_level(member_count):
+    """Oblicza poziom gildii na podstawie liczby członków"""
+    for level in sorted(GUILD_LEVELS.keys(), reverse=True):
+        if member_count >= GUILD_LEVELS[level]['members_required']:
+            return level
+    return 1
+
+async def guild_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """System gildii - główne menu"""
+    try:
+        user_id = update.effective_user.id
+        user_data = get_user_data_full(user_id)
+        guild_id, guild = get_user_guild(user_id)
+
+        if not context.args:
+            if guild:
+                # Użytkownik ma gildię - pokaż menu gildii
+                member_count = len(guild.get('members', []))
+                guild_level = get_guild_level(member_count)
+                guild_exp = guild.get('experience', 0)
+                last_mission = guild.get('last_mission', 0)
+                now = time.time()
+
+                guild_text = (
+                    f"🏛️ **TWOJA GILDIA: {guild['name']}**\n\n"
+                    f"👑 Lider: {guild['leader_name']}\n"
+                    f"👥 Członkowie: {member_count}/30\n"
+                    f"📊 Poziom: {guild_level} - {GUILD_LEVELS[guild_level]['name']}\n"
+                    f"⭐ Doświadczenie: {guild_exp}\n"
+                    f"💰 Bonus gildii: +{GUILD_LEVELS[guild_level]['bonus']}%\n\n"
+                )
+
+                # Sprawdź cooldown misji gildijnych
+                if now - last_mission < 3600:  # 1 godzina między misjami
+                    remaining = int(3600 - (now - last_mission))
+                    guild_text += f"⏰ Następna misja za {remaining//60}m {remaining%60}s\n\n"
+                else:
+                    guild_text += "✅ Misje gildijne dostępne!\n\n"
+
+                guild_text += (
+                    "**KOMENDY GILDII:**\n"
+                    "👥 `/guild members` - Lista członków\n"
+                    "🎯 `/guild mission` - Misje grupowe\n"
+                    "📊 `/guild stats` - Statystyki gildii\n"
+                    "💬 `/guild chat [wiadomość]` - Czat gildii\n"
+                    "👑 `/guild invite [user_id]` - Zaproś (lider)\n"
+                    "💰 `/guild donate [kwota]` - Wpłać do skarbca\n"
+                    "🚪 `/guild leave` - Opuść gildię"
+                )
+
+                await update.message.reply_text(guild_text, parse_mode='Markdown')
+            else:
+                # Użytkownik nie ma gildii - pokaż opcje
+                guilds_data = load_guilds_data()
+                open_guilds = [(gid, g) for gid, g in guilds_data.items() if g.get('recruitment_open', True) and len(g.get('members', [])) < 30]
+
+                guild_text = (
+                    "🏛️ **SYSTEM GILDII DON MLEKO**\n\n"
+                    "🎯 **NIE MASZ GILDII!**\n\n"
+                    "**OPCJE:**\n"
+                    "🆕 `/guild create [nazwa]` - Utwórz nową gildię (1000 DMT)\n"
+                    "🔍 `/guild list` - Zobacz dostępne gildie\n"
+                    "🤝 `/guild join [id_gildii]` - Dołącz do gildii\n\n"
+                    "🏆 **KORZYŚCI Z GILDII:**\n"
+                    "• Bonusy do wszystkich nagród\n"
+                    "• Wspólne misje z mega nagrodami\n"
+                    "• Prywatny czat gildii\n"
+                    "• Wzajemna pomoc między członkami\n"
+                    "• Rywalizacja z innymi gildiami\n\n"
+                    f"🌟 **Dostępne gildie: {len(open_guilds)}**\n"
+                    "💡 Gildie mogą mieć maksymalnie 30 członków!"
+                )
+
+                await update.message.reply_text(guild_text, parse_mode='Markdown')
+            return
+
+        action = context.args[0].lower()
+
+        if action == "create":
+            # Tworzenie nowej gildii
+            if guild:
+                await update.message.reply_text("❌ Już należysz do gildii! Opuść ją najpierw za pomocą `/guild leave`")
+                return
+
+            if len(context.args) < 2:
+                await update.message.reply_text("❌ Użycie: `/guild create [nazwa gildii]`")
+                return
+
+            guild_name = ' '.join(context.args[1:])
+            if len(guild_name) > 50:
+                await update.message.reply_text("❌ Nazwa gildii za długa! Maksymalnie 50 znaków.")
+                return
+
+            # Sprawdź koszt
+            cost = 1000
+            if user_data.get('points', 0) < cost:
+                await update.message.reply_text(f"❌ Potrzebujesz {cost} DMT aby utworzyć gildię!")
+                return
+
+            # Sprawdź czy nazwa nie jest zajęta
+            guilds_data = load_guilds_data()
+            for existing_guild in guilds_data.values():
+                if existing_guild.get('name', '').lower() == guild_name.lower():
+                    await update.message.reply_text("❌ Ta nazwa gildii jest już zajęta!")
+                    return
+
+            # Utwórz gildię
+            add_points(user_id, -cost)
+            guild_id = f"guild_{int(time.time())}_{user_id}"
+            username = update.effective_user.first_name or f"Gracz{str(user_id)[-4:]}"
+
+            new_guild = {
+                'name': guild_name,
+                'leader_id': str(user_id),
+                'leader_name': username,
+                'members': [str(user_id)],
+                'created_at': time.time(),
+                'experience': 0,
+                'treasury': 0,
+                'missions_completed': 0,
+                'last_mission': 0,
+                'recruitment_open': True,
+                'description': 'Nowa gildia w rodzinie Don Mleko!'
+            }
+
+            guilds_data[guild_id] = new_guild
+            save_guilds_data(guilds_data)
+
+            # Dodaj odznakę założyciela gildii
+            check_and_award_badge(user_id, "guild_founder")
+
+            await update.message.reply_text(
+                f"🏛️ **GILDIA UTWORZONA!**\n\n"
+                f"👑 Nazwa: **{guild_name}**\n"
+                f"👤 Lider: {username}\n"
+                f"💸 Koszt: {cost} DMT\n"
+                f"💎 Pozostało: {get_user_points(user_id)} DMT\n\n"
+                f"🎯 **Następne kroki:**\n"
+                f"👥 Zaproś członków: `/guild invite [user_id]`\n"
+                f"🎯 Wykonuj misje grupowe dla bonusów\n"
+                f"📈 Rozwijaj gildię zbierając doświadczenie!\n\n"
+                f"🏅 Zdobyłeś odznakę: Założyciel Gildii!"
+            )
+
+        elif action == "list":
+            # Lista dostępnych gildii
+            guilds_data = load_guilds_data()
+            open_guilds = [(gid, g) for gid, g in guilds_data.items() if g.get('recruitment_open', True)]
+
+            if not open_guilds:
+                await update.message.reply_text("🏛️ **Brak dostępnych gildii!**\n\n💡 Utwórz pierwszą: `/guild create [nazwa]`")
+                return
+
+            guild_list = "🏛️ **DOSTĘPNE GILDIE:**\n\n"
+
+            for guild_id, guild_data in open_guilds:
+                member_count = len(guild_data.get('members', []))
+                guild_level = get_guild_level(member_count)
+                guild_list += (
+                    f"🆔 **ID:** `{guild_id[-8:]}`\n"
+                    f"👑 **{guild_data['name']}**\n"
+                    f"👤 Lider: {guild_data['leader_name']}\n"
+                    f"👥 Członkowie: {member_count}/30\n"
+                    f"📊 Poziom: {guild_level} - {GUILD_LEVELS[guild_level]['name']}\n"
+                    f"💰 Bonus: +{GUILD_LEVELS[guild_level]['bonus']}%\n"
+                    f"📝 {guild_data.get('description', 'Brak opisu')}\n\n"
+                    f"🤝 Dołącz: `/guild join {guild_id[-8:]}`\n\n"
+                )
+
+            await update.message.reply_text(guild_list, parse_mode='Markdown')
+
+        elif action == "join":
+            # Dołączanie do gildii
+            if guild:
+                await update.message.reply_text("❌ Już należysz do gildii!")
+                return
+
+            if len(context.args) < 2:
+                await update.message.reply_text("❌ Użycie: `/guild join [id_gildii]`\nSprawdź ID w `/guild list`")
+                return
+
+            target_guild_short_id = context.args[1]
+            guilds_data = load_guilds_data()
+
+            # Znajdź gildię po skróconym ID
+            target_guild_id = None
+            for gid in guilds_data.keys():
+                if gid.endswith(target_guild_short_id):
+                    target_guild_id = gid
+                    break
+
+            if not target_guild_id:
+                await update.message.reply_text("❌ Nie znaleziono gildii o tym ID!")
+                return
+
+            target_guild = guilds_data[target_guild_id]
+
+            if len(target_guild.get('members', [])) >= 30:
+                await update.message.reply_text("❌ Ta gildia jest pełna!")
+                return
+
+            if not target_guild.get('recruitment_open', True):
+                await update.message.reply_text("❌ Ta gildia nie rekrutuje nowych członków!")
+                return
+
+            # Dołącz do gildii
+            username = update.effective_user.first_name or f"Gracz{str(user_id)[-4:]}"
+            target_guild['members'].append(str(user_id))
+            guilds_data[target_guild_id] = target_guild
+            save_guilds_data(guilds_data)
+
+            # Powiadom o dołączeniu
+            member_count = len(target_guild['members'])
+            guild_level = get_guild_level(member_count)
+
+            await update.message.reply_text(
+                f"🏛️ **DOŁĄCZONO DO GILDII!**\n\n"
+                f"👑 Gildia: **{target_guild['name']}**\n"
+                f"👤 Lider: {target_guild['leader_name']}\n"
+                f"👥 Członkowie: {member_count}/30\n"
+                f"📊 Poziom: {guild_level}\n"
+                f"💰 Bonus gildii: +{GUILD_LEVELS[guild_level]['bonus']}%\n\n"
+                f"🎉 Witaj w rodzinie!"
+            )
+
+            # Powiadom lidera
+            try:
+                await update.get_bot().send_message(
+                    chat_id=int(target_guild['leader_id']),
+                    text=f"🎉 **NOWY CZŁONEK GILDII!**\n\n"
+                         f"👤 {username} dołączył do {target_guild['name']}!\n"
+                         f"👥 Członkowie: {member_count}/30"
+                )
+            except:
+                pass
+
+        elif action == "members":
+            # Lista członków gildii
+            if not guild:
+                await update.message.reply_text("❌ Nie należysz do żadnej gildii!")
+                return
+
+            members_text = f"👥 **CZŁONKOWIE GILDII: {guild['name']}**\n\n"
+            member_count = len(guild.get('members', []))
+
+            # Pobierz dane wszystkich członków
+            data = load_user_data()
+            members_info = []
+
+            for member_id in guild.get('members', []):
+                if member_id in data:
+                    member_data = data[member_id]
+                    try:
+                        chat_member = await update.get_bot().get_chat(member_id)
+                        username = chat_member.first_name or f"Gracz{member_id[-4:]}"
+                    except:
+                        username = f"Gracz{member_id[-4:]}"
+
+                    members_info.append({
+                        'id': member_id,
+                        'name': username,
+                        'points': member_data.get('points', 0),
+                        'respect': member_data.get('mafia_respect', 0),
+                        'is_leader': member_id == guild['leader_id']
+                    })
+
+            # Sortuj według punktów
+            members_info.sort(key=lambda x: x['points'], reverse=True)
+
+            for i, member in enumerate(members_info, 1):
+                leader_icon = "👑 " if member['is_leader'] else ""
+                rank = get_mafia_rank(member['respect'])
+
+                members_text += (
+                    f"{i}. {leader_icon}**{member['name']}**\n"
+                    f"   💎 {member['points']:,} DMT | ⭐ {member['respect']} | 🤵 {rank}\n\n"
+                )
+
+            guild_level = get_guild_level(member_count)
+            members_text += (
+                f"📊 **PODSUMOWANIE:**\n"
+                f"👥 Łącznie członków: {member_count}/30\n"
+                f"📊 Poziom gildii: {guild_level}\n"
+                f"💰 Bonus: +{GUILD_LEVELS[guild_level]['bonus']}%"
+            )
+
+            await update.message.reply_text(members_text, parse_mode='Markdown')
+
+        elif action == "mission":
+            # Misje gildijne
+            if not guild:
+                await update.message.reply_text("❌ Nie należysz do żadnej gildii!")
+                return
+
+            member_count = len(guild.get('members', []))
+            available_missions = [m for m in GUILD_MISSIONS if member_count >= m['min_members']]
+
+            if not available_missions:
+                await update.message.reply_text(
+                    f"❌ **BRAK DOSTĘPNYCH MISJI!**\n\n"
+                    f"👥 Członkowie: {member_count}/30\n"
+                    f"🎯 Najmniejsza misja wymaga 2 członków (Patrol Rodziny)\n\n"
+                    f"💡 Zwerbujcie więcej członków!\n"
+                    f"📋 Dostępne misje według liczby członków:\n"
+                    f"• 2+ członków: Patrol Rodziny\n"
+                    f"• 3+ członków: Grupowy Napad, Misja Rekrutacyjna\n"
+                    f"• 4+ członków: Ochrona Sklepów\n"
+                    f"• 5+ członków: Wojna Gangów\n"
+                    f"• 6+ członków: Przemyt przez Granicę, Obrona Terytorium"
+                )
+                return
+
+            # Sprawdź cooldown
+            last_mission = guild.get('last_mission', 0)
+            now = time.time()
+
+            if now - last_mission < 3600:  # 1 godzina
+                remaining = int(3600 - (now - last_mission))
+                await update.message.reply_text(f"⏰ Następna misja gildii za {remaining//60}m {remaining%60}s!")
+                return
+
+            if len(context.args) < 2:
+                missions_text = "🎯 **DOSTĘPNE MISJE GILDII:**\n\n"
+                missions_text += f"👥 Członkowie: {member_count}/30\n"
+                missions_text += f"🔍 Sprawdzono: {len(GUILD_MISSIONS)} misji\n"
+                missions_text += f"✅ Dostępne: {len(available_missions)} misji\n\n"
+
+                # Przyciski dla misji
+                keyboard = []
+                
+                for i, mission in enumerate(available_missions, 1):
+                    missions_text += (
+                        f"{i}. **{mission['name']}** ({mission['difficulty']})\n"
+                        f"   📝 {mission['description']}\n"
+                        f"   👥 Wymagane: {mission['min_members']} członków\n"
+                        f"   💰 Nagroda: {mission['reward_per_member'][0]}-{mission['reward_per_member'][1]} DMT/osoba\n"
+                        f"   ⭐ Doświadczenie: +{mission['guild_experience']}\n"
+                        f"   ⏰ Cooldown: {mission['cooldown']//3600}h\n\n"
+                    )
+                    
+                    # Dodaj przycisk dla każdej misji
+                    button_text = f"🎯 {mission['name']}"
+                    if len(button_text) > 30:  # Skróć długie nazwy
+                        button_text = button_text[:27] + "..."
+                    
+                    keyboard.append([InlineKeyboardButton(
+                        button_text,
+                        callback_data=f"guild_mission_{i}"
+                    )])
+
+                # Przycisk powrotu
+                keyboard.append([InlineKeyboardButton("🔙 Powrót do Gildii", callback_data="back_to_guild")])
+                
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                missions_text += "👇 Kliknij misję aby rozpocząć lub użyj: `/guild mission [numer]`"
+                
+                await update.message.reply_text(missions_text, reply_markup=reply_markup, parse_mode='Markdown')
+                return
+
+            # Rozpocznij misję
+            try:
+                mission_id = int(context.args[1]) - 1
+                if mission_id < 0 or mission_id >= len(available_missions):
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text("❌ Podaj prawidłowy numer misji!")
+                return
+
+            mission = available_missions[mission_id]
+
+            # Sprawdź czy użytkownik to lider
+            if str(user_id) != guild['leader_id']:
+                await update.message.reply_text("❌ Tylko lider gildii może rozpoczynać misje!")
+                return
+
+            # Rozpocznij misję gildijną
+            success_chance = min(90, 50 + get_guild_level(member_count) * 10)
+
+            if random.randint(1, 100) <= success_chance:
+                # Sukces!
+                guilds_data = load_guilds_data()
+                guild = guilds_data[guild_id]
+
+                # Nagrody dla wszystkich członków
+                rewards_given = 0
+                for member_id in guild['members']:
+                    reward = random.randint(*mission['reward_per_member'])
+                    add_points(int(member_id), reward)
+                    rewards_given += reward
+
+                # Aktualizuj gildię
+                guild['last_mission'] = now
+                guild['experience'] += mission['guild_experience']
+                guild['missions_completed'] = guild.get('missions_completed', 0) + 1
+                guilds_data[guild_id] = guild
+                save_guilds_data(guilds_data)
+
+                # Powiadom wszystkich członków
+                for member_id in guild['members']:
+                    try:
+                        await update.get_bot().send_message(
+                            chat_id=int(member_id),
+                            text=f"🎉 **MISJA GILDII UDANA!**\n\n"
+                                 f"🎯 {mission['name']}\n"
+                                 f"💰 Twoja nagroda: {random.randint(*mission['reward_per_member'])} DMT\n"
+                                 f"⭐ Doświadczenie gildii: +{mission['guild_experience']}\n\n"
+                                 f"🏛️ Gildia: {guild['name']}"
+                        )
+                    except:
+                        pass
+
+                await update.message.reply_text(
+                    f"🎉 **MISJA GILDII UDANA!**\n\n"
+                    f"🎯 {mission['name']}\n"
+                    f"💰 Łączne nagrody: {rewards_given} DMT\n"
+                    f"⭐ Doświadczenie: +{mission['guild_experience']}\n"
+                    f"👥 Członkowie nagrodzeni: {len(guild['members'])}\n\n"
+                    f"🏛️ {guild['name']} staje się silniejsza!"
+                )
+            else:
+                # Porażka
+                guilds_data = load_guilds_data()
+                guild = guilds_data[guild_id]
+                guild['last_mission'] = now
+                guilds_data[guild_id] = guild
+                save_guilds_data(guilds_data)
+
+                await update.message.reply_text(
+                    f"💀 **MISJA NIEUDANA!**\n\n"
+                    f"🎯 {mission['name']}\n"
+                    f"😵 Gildia poniosła porażkę!\n"
+                    f"⚠️ Szanse były: {success_chance}%\n\n"
+                    f"⏰ Spróbujcie ponownie za godzinę!"
+                )
+
+        elif action == "donate":
+            # Darowizna do skarbca gildii
+            if not guild:
+                await update.message.reply_text("❌ Nie należysz do żadnej gildii!")
+                return
+
+            if len(context.args) < 2:
+                await update.message.reply_text("❌ Użycie: `/guild donate [kwota]`")
+                return
+
+            try:
+                donation = int(context.args[1])
+            except ValueError:
+                await update.message.reply_text("❌ Kwota musi być liczbą!")
+                return
+
+            if donation < 1:
+                await update.message.reply_text("❌ Minimalna darowizna to 1 DMT!")
+                return
+
+            user_points = user_data.get('points', 0)
+            if user_points < donation:
+                await update.message.reply_text(f"❌ Nie masz wystarczająco DMT! Masz: {user_points}, potrzebujesz: {donation}")
+                return
+
+            # Wykonaj darowiznę - odejmij punkty
+            new_points = add_points(user_id, -donation)
+
+            # Aktualizuj skarbiec gildii
+            guilds_data = load_guilds_data()
+            guild = guilds_data[guild_id]
+            guild['treasury'] = guild.get('treasury', 0) + donation
+            guilds_data[guild_id] = guild
+            save_guilds_data(guilds_data)
+
+            # Pobierz świeże dane użytkownika i aktualizuj statystyki
+            fresh_user_data = get_user_data_full(user_id)
+            fresh_user_data['guild_donations'] = fresh_user_data.get('guild_donations', 0) + donation
+            update_user_data(user_id, fresh_user_data)
+
+            await update.message.reply_text(
+                f"💰 **DAROWIZNA DLA GILDII!**\n\n"
+                f"🏛️ Gildia: **{guild['name']}**\n"
+                f"💸 Wpłaciłeś: {donation} DMT\n"
+                f"🏦 Skarbiec gildii: {guild['treasury']} DMT\n"
+                f"💎 Pozostało Ci: {new_points} DMT\n\n"
+                f"🙏 Dziękuje w imieniu całej gildii!"
+            )
+
+            # Powiadom lidera o darowizn ie
+            try:
+                await update.get_bot().send_message(
+                    chat_id=int(guild['leader_id']),
+                    text=f"💰 **NOWA DAROWIZNA!**\n\n"
+                         f"👤 {update.effective_user.first_name or 'Członek'} wpłacił {donation} DMT\n"
+                         f"🏦 Skarbiec: {guild['treasury']} DMT\n"
+                         f"🏛️ Gildia: {guild['name']}"
+                )
+            except:
+                pass
+
+        elif action == "leave":
+            # Opuszczenie gildii
+            if not guild:
+                await update.message.reply_text("❌ Nie należysz do żadnej gildii!")
+                return
+
+            guilds_data = load_guilds_data()
+
+            if str(user_id) == guild['leader_id']:
+                if len(guild['members']) > 1:
+                    await update.message.reply_text("❌ Nie możesz opuścić gildii jako lider! Najpierw przekaż przywództwo lub rozwiąż gildię.")
+                    return
+                else:
+                    # Usuń gildię jeśli lider był jedynym członkiem
+                    del guilds_data[guild_id]
+                    save_guilds_data(guilds_data)
+                    await update.message.reply_text(f"🏛️ Gildia **{guild['name']}** została rozwiązana!")
+                    return
+
+            # Usuń członka z gildii
+            guild['members'].remove(str(user_id))
+            guilds_data[guild_id] = guild
+            save_guilds_data(guilds_data)
+
+            await update.message.reply_text(f"🚪 Opuściłeś gildię **{guild['name']}**!")
+
+        elif action == "stats":
+            # Statystyki gildii
+            if not guild:
+                await update.message.reply_text("❌ Nie należysz do żadnej gildii!")
+                return
+
+            member_count = len(guild.get('members', []))
+            guild_level = get_guild_level(member_count)
+            experience = guild.get('experience', 0)
+            missions_completed = guild.get('missions_completed', 0)
+            treasury = guild.get('treasury', 0)
+
+            # Oblicz łączne statystyki członków
+            data = load_user_data()
+            total_points = 0
+            total_respect = 0
+            total_battles = 0
+
+            for member_id in guild['members']:
+                if member_id in data:
+                    member_data = data[member_id]
+                    total_points += member_data.get('points', 0)
+                    total_respect += member_data.get('mafia_respect', 0)
+                    total_battles += member_data.get('battle_wins', 0)
+
+            stats_text = (
+                f"📊 **STATYSTYKI GILDII: {guild['name']}**\n\n"
+                f"👑 Lider: {guild['leader_name']}\n"
+                f"👥 Członkowie: {member_count}/30\n"
+                f"📊 Poziom gildii: {guild_level} - {GUILD_LEVELS[guild_level]['name']}\n"
+                f"⭐ Doświadczenie: {experience}\n"
+                f"🎯 Ukończone misje: {missions_completed}\n"
+                f"💰 Skarbiec gildii: {treasury} DMT\n\n"
+                f"🔥 **SIŁA GILDII:**\n"
+                f"💎 Łączne punkty: {total_points:,}\n"
+                f"⭐ Łączny szacunek: {total_respect:,}\n"
+                f"⚔️ Łączne bitwy: {total_battles}\n\n"
+                f"🏆 Bonus dla członków: +{GUILD_LEVELS[guild_level]['bonus']}%"
+            )
+
+            await update.message.reply_text(stats_text, parse_mode='Markdown')
+
+        else:
+            await update.message.reply_text(
+                "❌ Nieznana akcja!\n\n"
+                "**DOSTĘPNE AKCJE:**\n"
+                "• create [nazwa] - Utwórz gildię\n"
+                "• list - Lista gildii\n"
+                "• join [id] - Dołącz do gildii\n"
+                "• members - Członkowie\n"
+                "• mission [nr] - Misje grupowe\n"
+                "• stats - Statystyki\n"
+                "• donate [kwota] - Wpłać do skarbca\n"
+                "• leave - Opuść gildię"
+            )
+
+    except Exception as e:
+        logging.error(f"Błąd w guild_system: {e}")
+        await update.message.reply_text("❌ Błąd w systemie gildii!")
+
+# === FUNKCJE SYSTEMU SPOŁECZNOŚCIOWEGO ===
+
+def load_social_feed():
+    """Ładuje posty z social feed"""
+    try:
+        if os.path.exists(FEED_POSTS_FILE):
+            with open(FEED_POSTS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except:
+        pass
+    return []
+
+def save_social_feed(posts):
+    """Zapisuje posty do social feed"""
+    try:
+        with open(FEED_POSTS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(posts, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.error(f"Błąd zapisywania social feed: {e}")
+
+def load_post_comments():
+    """Ładuje komentarze do postów"""
+    try:
+        if os.path.exists(COMMENTS_FILE):
+            with open(COMMENTS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except:
+        pass
+    return {}
+
+def save_post_comments(comments):
+    """Zapisuje komentarze do postów"""
+    try:
+        with open(COMMENTS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(comments, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.error(f"Błąd zapisywania komentarzy: {e}")
+
+def load_post_likes():
+    """Ładuje polubienia postów"""
+    try:
+        if os.path.exists(LIKES_FILE):
+            with open(LIKES_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except:
+        pass
+    return {}
+
+def save_post_likes(likes):
+    """Zapisuje polubienia postów"""
+    try:
+        with open(LIKES_FILE, 'w', encoding='utf-8') as f:
+            json.dump(likes, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.error(f"Błąd zapisywania polubień: {e}")
+
+def create_social_post(user_id, username, post_type, title, content, image_url=None):
+    """Tworzy nowy post społecznościowy"""
+    try:
+        posts = load_social_feed()
+
+        post_id = f"post_{int(time.time())}_{user_id}"
+
+        new_post = {
+            'id': post_id,
+            'user_id': str(user_id),
+            'username': username,
+            'type': post_type,
+            'title': title,
+            'content': content,
+            'image_url': image_url,
+            'timestamp': time.time(),
+            'likes_count': 0,
+            'comments_count': 0
+        }
+
+        posts.insert(0, new_post)  # Dodaj na początku
+
+        # Zachowaj tylko ostatnie 500 postów
+        if len(posts) > 500:
+            posts = posts[:500]
+
+        save_social_feed(posts)
+        return post_id
+    except Exception as e:
+        logging.error(f"Błąd tworzenia postu: {e}")
+        return None
+
+def auto_create_achievement_post(user_id, username, achievement_type, details):
+    """Automatycznie tworzy post o osiągnięciu"""
+    try:
+        achievement_messages = {
+            'level_up': f"🎉 Awansował na nowy poziom mining! {details}",
+            'mafia_rank': f"🤵 Awansował w mafii na rangę {details}!",
+            'jackpot': f"💰 Wygrał MEGA JACKPOT! {details} DMT!",
+            'badge': f"🏅 Zdobył nową odznakę: {details}!",
+            'territory': f"🏰 Zdobył nowe terytorium: {details}!",
+            'boss_title': f"👑 Został nowym bossem: {details}!",
+            'heist_master': f"💎 Został mistrzem napadów! {details} udanych akcji!",
+            'battle_champion': f"⚔️ Został championem areny! {details} zwycięstw!"
+        }
+
+        if achievement_type in achievement_messages:
+            title = f"{achievement_messages[achievement_type]}"
+            content = f"🎯 Gratulacje dla {username}! Niesamowite osiągnięcie w rodzinie Don Mleko!"
+
+            return create_social_post(user_id, username, 'achievement', title, content)
+    except Exception as e:
+        logging.error(f"Błąd auto-postu: {e}")
+        return None
+
+async def show_missions_category(query, user_data, category, title):
+    """Pokazuje misje z wybranej kategorii"""
+    try:
+        user_id = query.from_user.id
+        respect = user_data.get('mafia_respect', 0)
+        rank = get_mafia_rank(respect)
+
+        # Filtruj misje według kategorii
+        category_missions = []
+        difficulty_mapping = {
+            'easy': ['łatwy'],
+            'medium': ['średni'],
+            'hard': ['trudny', 'bardzo trudny'],
+            'expert': ['ekspert', 'legendarna', 'mityczna', 'boski', 'transcendentny']
+        }
+
+        for i, mission in enumerate(MISSIONS, 1):
+            if mission['difficulty'] in difficulty_mapping[category]:
+                category_missions.append((i, mission))
+
+        missions_text = f"{title}\n\n"
+        missions_text += f"👤 Twoja ranga: {rank}\n"
+        missions_text += f"⭐ Szacunek: {respect}\n\n"
+
+        # Sprawdź cooldown
+        last_mission = user_data.get('last_mission', 0)
+        now = time.time()
+        cooldown_active = now - last_mission < 1800
+
+        if cooldown_active:
+            remaining = int(1800 - (now - last_mission))
+            missions_text += f"⏰ Następna misja za {remaining//60}m {remaining%60}s!\n\n"
+
+        keyboard = []
+
+        # Dodaj przyciski dla misji w kategorii
+        for i, (mission_index, mission) in enumerate(category_missions, 1):
+            success_bonus = MAFIA_RANKS[rank]['bonus']
+            base_chance = {
+                'łatwy': 80,
+                'średni': 60,
+                'trudny': 40,
+                'bardzo trudny': 20,
+                'ekspert': 15,
+                'legendarna': 10,
+                'mityczna': 5,
+                'boski': 3,
+                'transcendentny': 1
+            }
+            success_chance = min(95, base_chance.get(mission['difficulty'], 50) + success_bonus)
+
+            missions_text += (
+                f"{i}. **{mission['name']}** ({mission['difficulty']})\n"
+                f"   📝 {mission['description']}\n"
+                f"   💰 Nagroda: {mission['reward'][0]}-{mission['reward'][1]} DMT\n"
+                f"   ⭐ Szacunek: +{mission['respect']}\n"
+                f"   ⏱️ Czas: {mission['time_required']//60} min\n"
+                f"   🎯 Szanse: ~{success_chance}%\n\n"
+            )
+
+            # Dodaj przycisk tylko jeśli nie ma cooldown
+            if not cooldown_active:
+                button_text = f"🎯 {mission['name']}"
+                if len(button_text) > 30:  # Skróć długie nazwy
+                    button_text = button_text[:27] + "..."
+
+                keyboard.append([InlineKeyboardButton(
+                    button_text,
+                    callback_data=f"start_mission_{mission_index}"
+                )])
+
+        # Przyciski nawigacyjne
+        nav_keyboard = [
+            [InlineKeyboardButton("🔄 Wszystkie Misje", callback_data="missions")],
+            [InlineKeyboardButton("🔙 Powrót do Mafii", callback_data="back_to_mafia")]
+        ]
+
+        keyboard.extend(nav_keyboard)
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        if not category_missions:
+            missions_text += "❌ Brak misji w tej kategorii!"
+
+        await query.edit_message_text(
+            missions_text,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+    except Exception as e:
+        logging.error(f"Błąd w show_missions_category: {e}")
+        await query.answer("❌ Błąd przy ładowaniu misji!", show_alert=True)
+
+async def show_bosses(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.effective_user.id
+        user_data = get_user_data_full(user_id)
+
+        bosses_text = "👑 **HIERARCHIA MAFII DON MLEKO:**\n\n"
+
+        for boss_id, boss_info in MAFIA_BOSSES.items():
+            bosses_text += (
+                f"{boss_info['name']}\n"
+                f"👔 {boss_info['title']}\n"
+                f"⭐ Szacunek: {boss_info['respect']:,}\n"
+                f"📝 {boss_info['description']}\n"
+                f"🔥 {boss_info['special_power']}\n\n"
+            )
+
+        user_respect = user_data.get('mafia_respect', 0)
+        user_rank = get_mafia_rank(user_respect)
+
+        bosses_text += (
+            f"**TWOJA POZYCJA:**\n"
+            f"👤 Ranga: {user_rank}\n"
+            f"⭐ Szacunek: {user_respect}\n\n"
+            f"💡 Zdobywaj szacunek aby awansować w hierarchii!"
+        )
+
+        # Sprawdź czy gracz ma specjalne misje od bossów
+        special_missions = user_data.get('special_missions', [])
+        if special_missions:
+            bosses_text += f"\n🎯 Masz {len(special_missions)} specjalnych misji od bossów!"
+
+        await update.message.reply_text(bosses_text, parse_mode='Markdown')
+
+    except Exception as e:
+        logging.error(f"Błąd w show_bosses: {e}")
+        await update.message.reply_text("❌ Błąd w hierarchii bossów!")
+
+# === KOMENDY SYSTEMU SPOŁECZNOŚCIOWEGO ===
+
+async def social_feed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Pokazuje najnowsze posty społecznościowe"""
+    try:
+        posts = load_social_feed()
+
+        if not posts:
+            await update.message.reply_text(
+                "📱 **SOCIAL FEED RODZINY**\n\n"
+                "🔍 Brak postów! Bądź pierwszy!\n\n"
+                "💡 Używaj:\n"
+                "📝 `/post [typ] [tytuł] [treść]` - nowy post\n"
+                "👍 `/like [id]` - polub post\n"
+                "💬 `/comment [id] [komentarz]` - skomentuj\n"
+                "📖 `/read [id]` - czytaj post z komentarzami"
+            )
+            return
+
+        # Pokaż ostatnie 10 postów
+        feed_text = "📱 **NAJNOWSZE POSTY RODZINY:**\n\n"
+
+        for post in posts[:10]:
+            post_type = POST_TYPES.get(post['type'], '📝 Post')
+            time_ago = get_time_ago(post['timestamp'])
+
+            feed_text += (
+                f"🆔 **ID: {post['id'][-8:]}** | {post_type}\n"
+                f"👤 **{post['username']}** • {time_ago}\n"
+                f"📝 **{post['title']}**\n"
+                f"👍 {post['likes_count']} • 💬 {post['comments_count']}\n\n"
+            )
+
+        feed_text += (
+            "**KOMENDY:**\n"
+            "📝 `/post [typ] [tytuł] [treść]` - napisz post\n"
+            "📖 `/read [id]` - czytaj cały post\n"
+            "👍 `/like [id]` - polub\n"
+            "💬 `/comment [id] [treść]` - skomentuj\n\n"
+            "**TYPY POSTÓW:** achievement, victory, jackpot, milestone, funny, help, announcement"
+        )
+
+        await update.message.reply_text(feed_text, parse_mode='Markdown')
+
+    except Exception as e:
+        logging.error(f"Błąd w social_feed: {e}")
+        await update.message.reply_text("❌ Błąd w social feed!")
+
+async def create_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tworzy nowy post społecznościowy"""
+    try:
+        user_id = update.effective_user.id
+        username = update.effective_user.first_name or f"Gracz{str(user_id)[-4:]}"
+
+        if not context.args or len(context.args) < 3:
+            await update.message.reply_text(
+                "📝 **TWORZENIE POSTU**\n\n"
+                "Użycie: `/post [typ] [tytuł] [treść]`\n\n"
+                "🎯 **DOSTĘPNE TYPY:**\n"
+                "• achievement - 🏆 Osiągnięcie\n"
+                "• victory - ⚔️ Zwycięstwo\n"
+                "• jackpot - 💰 Jackpot\n"
+                "• milestone - 🎯 Kamień milowy\n"
+                "• funny - 😂 Zabawne\n"
+                "• help - ❓ Pomoc\n"
+                "• announcement - 📢 Ogłoszenie\n\n"
+                "📝 **Przykład:**\n"
+                "`/post victory 'Wygrana w blackjack' 'Właśnie wygrałem 500 DMT w blackjack! 🎉'`"
+            )
+            return
+
+        post_type = context.args[0].lower()
+        if post_type not in POST_TYPES:
+            await update.message.reply_text("❌ Nieprawidłowy typ postu! Użyj: achievement, victory, jackpot, milestone, funny, help, announcement")
+            return
+
+        remaining_text = ' '.join(context.args[1:])
+
+        # Próbuj rozdzielić tytuł i treść (przez pierwszy pojedynczy cudzysłów lub pierwszy dwukropek)
+        if "'" in remaining_text:
+            parts = remaining_text.split("'")
+            if len(parts) >= 3:
+                title = parts[1]
+                content = parts[2].strip()
+            else:
+                title = remaining_text[:50]
+                content = remaining_text
+        elif ":" in remaining_text:
+            parts = remaining_text.split(":", 1)
+            title = parts[0].strip()
+            content = parts[1].strip()
+        else:
+            title = remaining_text[:50] + "..." if len(remaining_text) > 50 else remaining_text
+            content = remaining_text
+
+        if len(title) > 100:
+            await update.message.reply_text("❌ Tytuł za długi! Maksymalnie 100 znaków.")
+            return
+
+        if len(content) > 500:
+            await update.message.reply_text("❌ Treść za długa! Maksymalnie 500 znaków.")
+            return
+
+        # Sprawdź cooldown (5 minut między postami)
+        user_data = get_user_data_full(user_id)
+        last_post = user_data.get('last_post_time', 0)
+        if time.time() - last_post < 300:
+            remaining = int(300 - (time.time() - last_post))
+            await update.message.reply_text(f"⏰ Możesz napisać kolejny post za {remaining//60}m {remaining%60}s!")
+            return
+
+        # Utwórz post
+        post_id = create_social_post(user_id, username, post_type, title, content)
+
+        if post_id:
+            # Aktualizuj dane użytkownika
+            user_data['last_post_time'] = time.time()
+            user_data['posts_created'] = user_data.get('posts_created', 0) + 1
+            update_user_data(user_id, user_data)
+
+            # Dodaj punkty za utworzenie postu
+            points = add_points(user_id, 5)
+
+            await update.message.reply_text(
+                f"✅ **POST UTWORZONY!**\n\n"
+                f"🆔 ID: {post_id[-8:]}\n"
+                f"🎯 Typ: {POST_TYPES[post_type]}\n"
+                f"📝 Tytuł: {title}\n"
+                f"💎 +5 punktów za post! Masz: {points}\n\n"
+                f"📱 Sprawdź `/feed` aby zobaczyć swój post!"
+            )
+        else:
+            await update.message.reply_text("❌ Błąd podczas tworzenia postu!")
+
+    except Exception as e:
+        logging.error(f"Błąd w create_post: {e}")
+        await update.message.reply_text("❌ Błąd podczas tworzenia postu!")
+
+async def like_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Polub post"""
+    try:
+        user_id = update.effective_user.id
+
+        if not context.args:
+            await update.message.reply_text("👍 Użycie: `/like [ID postu]`\nSprawdź ID w `/feed`")
+            return
+
+        post_id_short = context.args[0]
+        posts = load_social_feed()
+        likes = load_post_likes()
+
+        # Znajdź post po skróconym ID
+        target_post = None
+        for post in posts:
+            if post['id'].endswith(post_id_short):
+                target_post = post
+                break
+
+        if not target_post:
+            await update.message.reply_text("❌ Nie znaleziono postu o tym ID!")
+            return
+
+        post_id = target_post['id']
+
+        # Sprawdź czy już polubił
+        if post_id not in likes:
+            likes[post_id] = []
+
+        if str(user_id) in likes[post_id]:
+            # Usuń polubienie
+            likes[post_id].remove(str(user_id))
+            action = "usunąłeś polubienie"
+            emoji = "💔"
+        else:
+            # Dodaj polubienie
+            likes[post_id].append(str(user_id))
+            action = "polubiłeś post"
+            emoji = "👍"
+
+            # Dodaj punkty autorowi postu (jeśli to nie on sam)
+            if target_post['user_id'] != str(user_id):
+                add_points(int(target_post['user_id']), 1)
+
+        # Aktualizuj licznik polubień w poście
+        for i, post in enumerate(posts):
+            if post['id'] == post_id:
+                posts[i]['likes_count'] = len(likes[post_id])
+                break
+
+        save_post_likes(likes)
+        save_social_feed(posts)
+
+        await update.message.reply_text(
+            f"{emoji} **{action.upper()}!**\n\n"
+            f"📝 Post: {target_post['title'][:50]}{'...' if len(target_post['title']) > 50 else ''}\n"
+            f"👤 Autor: {target_post['username']}\n"
+            f"👍 Łącznie polubień: {len(likes[post_id])}"
+        )
+
+    except Exception as e:
+        logging.error(f"Błąd w like_post: {e}")
+        await update.message.reply_text("❌ Błąd podczas polubienia!")
+
+async def comment_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Dodaj komentarz do postu"""
+    try:
+        user_id = update.effective_user.id
+        username = update.effective_user.first_name or f"Gracz{str(user_id)[-4:]}"
+
+        if not context.args or len(context.args) < 2:
+            await update.message.reply_text(
+                "💬 **SZYBKIE KOMENTOWANIE:**\n\n"
+                "📝 `/comment [ID] [treść]` - pełny komentarz\n"
+                "⚡ `/c [ID] [treść]` - szybki komentarz\n\n"
+                "🚀 **GOTOWE REAKCJE:**\n"
+                "👍 `/c [ID] +` - Świetne!\n"
+                "😂 `/c [ID] lol` - Haha!\n"
+                "🔥 `/c [ID] fire` - Super!\n"
+                "💎 `/c [ID] dmt` - Do księżyca!\n"
+                "🐄 `/c [ID] don` - Don Mleko approves!\n"
+                "⚡ `/c [ID] fast` - Szybko!\n"
+                "❤️ `/c [ID] love` - Kocham to!\n"
+                "💪 `/c [ID] strong` - Mocne!"
+            )
+            return
+
+        post_id_short = context.args[0]
+        comment_text = ' '.join(context.args[1:])
+
+        # Automatyczne rozszerzenie skróconych komentarzy
+        quick_comments = {
+            '+': '👍 Świetne!',
+            'lol': '😂 Haha, dobre!',
+            'fire': '🔥 Super sprawa!',
+            'dmt': '💎 DMT do księżyca!',
+            'don': '🐄 Don Mleko approves!',
+            'fast': '⚡ Szybko i sprawnie!',
+            'love': '❤️ Kocham to!',
+            'strong': '💪 Mocne!',
+            'nice': '👌 Ładnie!',
+            'wow': '😮 Wow!',
+            'yes': '✅ Tak!',
+            'no': '❌ Nie ma mowy!',
+            'maybe': '🤔 Może...',
+            'king': '👑 Król!',
+            'legend': '🏆 Legenda!',
+            'moon': '🚀 Na księżyc!',
+            'mleko': '🥛 Mleko power!',
+            'mafia': '🤵 Rodzina!',
+            'battle': '⚔️ Do bitwy!',
+            'mining': '⛏️ Kopalnia!'
+        }
+
+        if comment_text.lower() in quick_comments:
+            comment_text = quick_comments[comment_text.lower()]
+
+        if len(comment_text) > 200:
+            await update.message.reply_text("❌ Komentarz za długi! Maksymalnie 200 znaków.")
+            return
+
+        posts = load_social_feed()
+        comments = load_post_comments()
+
+        # Znajdź post
+        target_post = None
+        for post in posts:
+            if post['id'].endswith(post_id_short):
+                target_post = post
+                break
+
+        if not target_post:
+            await update.message.reply_text("❌ Nie znaleziono postu o tym ID!")
+            return
+
+        post_id = target_post['id']
+
+        # Dodaj komentarz
+        if post_id not in comments:
+            comments[post_id] = []
+
+        new_comment = {
+            'user_id': str(user_id),
+            'username': username,
+            'comment': comment_text,
+            'timestamp': time.time()
+        }
+
+        comments[post_id].append(new_comment)
+
+        # Aktualizuj licznik komentarzy
+        for i, post in enumerate(posts):
+            if post['id'] == post_id:
+                posts[i]['comments_count'] = len(comments[post_id])
+                break
+
+        save_post_comments(comments)
+        save_social_feed(posts)
+
+        # Dodaj punkty autorowi postu i komentującemu
+        if target_post['user_id'] != str(user_id):
+            add_points(int(target_post['user_id']), 1)  # Autor dostaje punkt za komentarz
+        points = add_points(user_id, 2)  # Komentujący dostaje 2 punkty
+
+        await update.message.reply_text(
+            f"💬 **KOMENTARZ DODANY!**\n\n"
+            f"📝 Do postu: {target_post['title'][:40]}{'...' if len(target_post['title']) > 40 else ''}\n"
+            f"👤 Autor postu: {target_post['username']}\n"
+            f"💬 Komentarzy: {len(comments[post_id])}\n"
+            f"💎 +2 punkty! Masz: {points}"
+        )
+
+    except Exception as e:
+        logging.error(f"Błąd w comment_post: {e}")
+        await update.message.reply_text("❌ Błąd podczas dodawania komentarza!")
+
+async def read_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Czytaj pełny post z komentarzami"""
+    try:
+        if not context.args:
+            await update.message.reply_text("📖 Użycie: `/read [ID postu]`\nSprawdź ID w `/feed`")
+            return
+
+        post_id_short = context.args[0]
+        posts = load_social_feed()
+        comments = load_post_comments()
+        likes = load_post_likes()
+
+        # Znajdź post
+        target_post = None
+        for post in posts:
+            if post['id'].endswith(post_id_short):
+                target_post = post
+                break
+
+        if not target_post:
+            await update.message.reply_text("❌ Nie znaleziono postu o tym ID!")
+            return
+
+        post_id = target_post['id']
+        post_type = POST_TYPES.get(target_post['type'], '📝 Post')
+        time_ago = get_time_ago(target_post['timestamp'])
+
+        # Zbuduj tekst postu
+        post_text = (
+            f"📖 **PEŁNY POST**\n\n"
+            f"🆔 ID: {post_id[-8:]}\n"
+            f"🎯 Typ: {post_type}\n"
+            f"👤 Autor: **{target_post['username']}**\n"
+            f"🕒 {time_ago}\n\n"
+            f"📝 **{target_post['title']}**\n\n"
+            f"{target_post['content']}\n\n"
+            f"👍 {len(likes.get(post_id, []))} polubień • 💬 {len(comments.get(post_id, []))} komentarzy"
+        )
+
+        # Dodaj komentarze (ostatnie 5)
+        post_comments = comments.get(post_id, [])
+        if post_comments:
+            post_text += "\n\n💬 **KOMENTARZE:**\n"
+            recent_comments = post_comments[-5:]  # Ostatnie 5
+
+            for comment in recent_comments:
+                comment_time = get_time_ago(comment['timestamp'])
+                post_text += f"\n👤 **{comment['username']}** • {comment_time}\n💭 {comment['comment']}\n"
+
+            if len(post_comments) > 5:
+                post_text += f"\n... i {len(post_comments) - 5} więcej komentarzy"
+
+        post_text += f"\n\n**AKCJE:**\n👍 `/like {post_id_short}` • 💬 `/comment {post_id_short} [treść]`"
+
+        await update.message.reply_text(post_text, parse_mode='Markdown')
+
+    except Exception as e:
+        logging.error(f"Błąd w read_post: {e}")
+        await update.message.reply_text("❌ Błąd podczas czytania postu!")
+
+def get_time_ago(timestamp):
+    """Zwraca czas jako 'X godzin temu' itp."""
+    try:
+        now = time.time()
+        diff = int(now - timestamp)
+
+        if diff < 60:
+            return f"{diff}s temu"
+        elif diff < 3600:
+            return f"{diff//60}m temu"
+        elif diff < 86400:
+            return f"{diff//3600}h temu"
+        else:
+            return f"{diff//86400}d temu"
+    except:
+        return "niedawno"
+
+async def mega_boost(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Aktywuj mega bonusy za DMT"""
+    try:
+        user_id = update.effective_user.id
+        user_data = get_user_data_full(user_id)
+
+        if not context.args:
+            active_boosts = user_data.get('active_boosts', {})
+            boost_text = "🚀 **MEGA BOOST SYSTEM**\n\n"
+
+            boost_text += "**DOSTĘPNE BOOSTY:**\n"
+            boost_text += "• double_mining (2h) - x2 mining rewards (1000 DMT)\n"
+            boost_text += "• triple_gambling (1h) - x3 gambling wins (1500 DMT)\n"
+            boost_text += "• mega_luck (30min) - x5 rzadkie minerały (2000 DMT)\n"
+            boost_text += "• time_master (4h) - 50% szybsze cooldown'y (2500 DMT)\n"
+            boost_text += "• ultimate_power (1h) - WSZYSTKO x3! (5000 DMT)\n\n"
+
+            if active_boosts:
+                boost_text += "**AKTYWNE BOOSTY:**\n"
+                for boost, end_time in active_boosts.items():
+                    if time.time() < end_time:
+                        remaining = int(end_time - time.time())
+                        boost_text += f"• {boost}: {remaining//60}m {remaining%60}s\n"
+            else:
+                boost_text += "**Brak aktywnych boostów**\n"
+
+            boost_text += "\nUżyj: `/megaboost [typ]` aby aktywować!"
+            await update.message.reply_text(boost_text, parse_mode='Markdown')
+            return
+
+        boost_type = context.args[0].lower()
+        boost_costs = {
+            'double_mining': {'cost': 1000, 'duration': 7200},
+            'triple_gambling': {'cost': 1500, 'duration': 3600},
+            'mega_luck': {'cost': 2000, 'duration': 1800},
+            'time_master': {'cost': 2500, 'duration': 14400},
+            'ultimate_power': {'cost': 5000, 'duration': 3600}
+        }
+
+        if boost_type not in boost_costs:
+            await update.message.reply_text("❌ Nieznany boost! Dostępne: double_mining, triple_gambling, mega_luck, time_master, ultimate_power")
+            return
+
+        cost = boost_costs[boost_type]['cost']
+        duration = boost_costs[boost_type]['duration']
+
+        if user_data.get('points', 0) < cost:
+            await update.message.reply_text(f"❌ Potrzebujesz {cost} DMT na ten boost!")
+            return
+
+        add_points(user_id, -cost)
+
+        # Aktywuj boost
+        active_boosts = user_data.get('active_boosts', {})
+        active_boosts[boost_type] = time.time() + duration
+        user_data['active_boosts'] = active_boosts
+        update_user_data(user_id, user_data)
+
+        await update.message.reply_text(
+            f"🚀 **MEGA BOOST AKTYWOWANY!**\n\n"
+            f"⚡ Boost: {boost_type}\n"
+            f"⏰ Czas trwania: {duration//60} minut\n"
+            f"💸 Koszt: {cost} DMT\n"
+            f"💎 Pozostało: {get_user_points(user_id)} DMT\n\n"
+            f"🔥 Boost jest teraz aktywny!"
+        )
+
+    except Exception as e:
+        logging.error(f"Błąd w mega_boost: {e}")
+        await update.message.reply_text("❌ Błąd w mega boost!")
+
+async def god_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tryb boga dla legends"""
+    try:
+        user_id = update.effective_user.id
+        user_data = get_user_data_full(user_id)
+
+        # Wymagania: 100k+ punktów, Don rang, Forteca Mleka
+        if user_data.get('points', 0) < 100000:
+            await update.message.reply_text(f"❌ God Mode wymaga 100,000+ punktów! Masz: {user_data.get('points', 0):,}")
+            return
+
+        if get_mafia_rank(user_data.get('mafia_respect', 0)) != 'Don':
+            await update.message.reply_text("❌ God Mode wymaga rangi Don w mafii!")
+            return
+
+        if 'forteca_mleka' not in user_data.get('special_buildings', []):
+            await update.message.reply_text("❌ God Mode wymaga Forteca Mleka!")
+            return
+
+        # Sprawdź cooldown (24 godziny)
+        last_godmode = user_data.get('last_godmode', 0)
+        now = time.time()
+
+        if now - last_godmode < 86400:
+            remaining = int(86400 - (now - last_godmode))
+            hours = remaining // 3600
+            minutes = (remaining % 3600) // 60
+            await update.message.reply_text(f"⚡ God Mode dostępny za {hours}h {minutes}m!")
+            return
+
+        # Aktywuj God Mode
+        god_rewards = random.randint(25000, 100000)
+        mining_levels = random.randint(3, 10)
+        respect_bonus = random.randint(1000, 5000)
+
+        # Mega nagrody
+        points = add_points(user_id, god_rewards)
+        user_data = get_user_data_full(user_id)
+        user_data['mining_level'] = user_data.get('mining_level', 1) + mining_levels
+        user_data['mafia_respect'] = user_data.get('mafia_respect', 0) + respect_bonus
+        user_data['last_godmode'] = now
+
+        # Resetuj wszystkie cooldown'y
+        for location in MINING_LOCATIONS.keys():
+            user_data[f'last_mine_{location}'] = 0
+        user_data['last_mine'] = 0
+        user_data['last_heist'] = 0
+        user_data['last_mission'] = 0
+        user_data['last_lottery'] = 0
+
+        # Specjalna odznaka
+        if check_and_award_badge(user_id, "don_mleko_blessed"):
+            badge_text = "\n🏅 Nowa odznaka: Błogosławiony przez Dona!"
+        else:
+            badge_text = ""
+
+        update_user_data(user_id, user_data)
+
+        # Auto-post o god mode
+        username = update.effective_user.first_name or f"Gracz{str(user_id)[-4:]}"
+        auto_create_achievement_post(user_id, username, 'boss_title', 'GOD MODE ACTIVATED!')
+
+        await update.message.reply_text(
+            f"⚡👑 **GOD MODE ACTIVATED!** 👑⚡\n\n"
+            f"🌟 Don Mleko błogosławi Cię!\n\n"
+            f"🎁 **MEGA NAGRODY:**\n"
+            f"💎 +{god_rewards:,} DMT\n"
+            f"⛏️ +{mining_levels} poziomów mining\n"
+            f"⭐ +{respect_bonus:,} szacunku\n"
+            f"🔄 Wszystkie cooldown'y zresetowane\n"
+            f"{badge_text}\n\n"
+            f"🏆 Łącznie punktów: {points:,}\n"
+            f"👑 Jesteś prawdziwą legendą rodziny!"
+        )
+
+    except Exception as e:
+        logging.error(f"Błąd w god_mode: {e}")
+        await update.message.reply_text("❌ Błąd w trybie boga!")
+
+async def my_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Pokaż swoje posty"""
+    try:
+        user_id = update.effective_user.id
+        posts = load_social_feed()
+        likes = load_post_likes()
+        comments = load_post_comments()
+
+        user_posts = [post for post in posts if post['user_id'] == str(user_id)]
+
+        if not user_posts:
+            await update.message.reply_text(
+                "📝 **TWOJE POSTY**\n\n"
+                "🔍 Nie masz jeszcze żadnych postów!\n\n"
+                "💡 Utwórz pierwszy post:\n"
+                "`/post [typ] [tytuł] [treść]`"
+            )
+            return
+
+        posts_text = f"📝 **TWOJE POSTY ({len(user_posts)}):**\n\n"
+
+        for post in user_posts[:10]:  # Ostatnie 10
+            post_type = POST_TYPES.get(post['type'], '📝 Post')
+            time_ago = get_time_ago(post['timestamp'])
+
+            posts_text += (
+                f"🆔 {post['id'][-8:]} | {post_type}\n"
+                f"📝 **{post['title']}**\n"
+                f"🕒 {time_ago}\n"
+                f"👍 {len(likes.get(post['id'], []))} • 💬 {len(comments.get(post['id'], []))}\n\n"
+            )
+
+        if len(user_posts) > 10:
+            posts_text += f"... i {len(user_posts) - 10} więcej postów"
+
+        await update.message.reply_text(posts_text, parse_mode='Markdown')
+
+    except Exception as e:
+        logging.error(f"Błąd w my_posts: {e}")
+        await update.message.reply_text("❌ Błąd podczas pobierania Twoich postów!")
+
+# === HISTORIE DON MLEKO ===
+
+async def historia_don_mleko(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Główna historia Don Mleko"""
+    try:
+        user_id = update.effective_user.id
+        points, success = add_points_with_limit(user_id, 5)
+
+        historia_text = (
+            "🌑 **CIEMNA HISTORIA DON MLEKA**\n\n"
+            "Zaczęło się od jednej kropli mleka. W cyberprzyszłości, gdzie memy rządzą wartością, "
+            "a blockchainy splatają się jak pajęczyny w neonowych uliczkach Web3, pojawił się on – Don Mleko.\n\n"
+            "🐄 **Krowi boss**, który zamienił zwykłe mleko w cyfrowe paliwo memów. Z jego tokenem, DMT, "
+            "powstał ruch. Powstała rodzina. To dopiero początek.\n\n"
+            "Ale cofnijmy się do początków, zanim mleko stało się legendą. W mrocznym, zimnym świecie, "
+            "gdzie przetrwanie zależało od długów i zdrad, Don Mleko nie był bossem od urodzenia.\n\n"
+            "📚 **WIĘCEJ HISTORII:**\n"
+            "🦌 `/rogacz` - Historia Białego Rogacza\n"
+            "🥛 `/milo` - Początki jako Milo\n"
+            "💀 `/lactosa` - Masakra Lactosa\n"
+            "🔴 `/kefir` - Zdrajca Kefir\n\n"
+            f"💎 +5 punktów za czytanie historii! Masz: {points}"
+        )
+
+        await update.message.reply_text(historia_text, parse_mode='Markdown')
+    except Exception as e:
+        logging.error(f"Błąd w historia_don_mleko: {e}")
+        await update.message.reply_text("❌ Błąd w historii!")
+
+async def historia_bialego_rogacza(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Historia Białego Rogacza"""
+    try:
+        user_id = update.effective_user.id
+        points, success = add_points_with_limit(user_id, 3)
+
+        historia_text = (
+            "🦌 **BIAŁY ROGACZ - PRAWA RĘKA DONA**\n\n"
+            "Potężny biały byk w eleganckim garniturze. Prawa ręka Don Mleko i jego najbardziej zaufany doradca.\n\n"
+            "🤵 **Jego historia:**\n"
+            "Niegdyś był zwykłym bykiem na farmie, ale jego inteligencja i lojalność przykuły uwagę Don Mleko. "
+            "Kiedy Don potrzebował kogoś, komu mógł zaufać w najtrudniejszych momentach, Biały Rogacz stał się "
+            "jego prawą ręką.\n\n"
+            "⚡ **Specjalne moce:**\n"
+            "• Może werbować nowych członków\n"
+            "• Daje specjalne misje\n"
+            "• Zarządza operacjami rodziny\n\n"
+            "👑 **Pozycja w hierarchii:** #2 w rodzinie\n\n"
+            f"💎 +3 punkty za poznanie historii! Masz: {points}"
+        )
+
+        await update.message.reply_text(historia_text, parse_mode='Markdown')
+    except Exception as e:
+        logging.error(f"Błąd w historia_bialego_rogacza: {e}")
+        await update.message.reply_text("❌ Błąd w historii Białego Rogacza!")
+
+async def masakra_lactosa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Historia Masakry Lactosa"""
+    try:
+        user_id = update.effective_user.id
+        points, success = add_points_with_limit(user_id, 4)
+
+        historia_text = (
+            "💀 **MASAKRA LACTOSA - KRWAWY DZIEŃ**\n\n"
+            "Najciemniejszy dzień w historii mlecznego imperium. Gang Czarnej Serwatki, "
+            "dowodzony przez bezwzględnego Barona Kwaśnego, zaatakował rodzinę Don Mleko.\n\n"
+            "🔥 **Co się stało:**\n"
+            "• Spalili farmy mleka\n"
+            "• Splądrowali silosy\n"
+            "• Zostawili Dona na śmierć\n"
+            "• Zniszczyli pół imperium\n\n"
+            "⚔️ **Zemsta:**\n"
+            "Ale Don Mleko przeżył. Wrócił silniejszy niż kiedykolwiek i przeprowadził "
+            "największą zemstę w historii. Baron Kwaśny zniknął bez śladu, a Czarna Serwatka "
+            "została kompletnie zniszczona.\n\n"
+            "🏆 **Rezultat:** Don Mleko stał się legendą\n\n"
+            f"💎 +4 punkty za odwagę w czytaniu! Masz: {points}"
+        )
+
+        await update.message.reply_text(historia_text, parse_mode='Markdown')
+    except Exception as e:
+        logging.error(f"Błąd w masakra_lactosa: {e}")
+        await update.message.reply_text("❌ Błąd w historii masakry!")
+
+async def historia_milo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Historia początków jako Milo"""
+    try:
+        user_id = update.effective_user.id
+        points, success = add_points_with_limit(user_id, 3)
+
+        historia_text = (
+            "🥛 **MILO - SKROMNE POCZĄTKI**\n\n"
+            "Zanim został Don Mleko, nazywał się po prostu Milo – prosty dostawca mleka "
+            "z zapomnianej wioski na peryferiach cyfrowego chaosu.\n\n"
+            "🚚 **Jego życie:**\n"
+            "Każdego dnia woził butelki po wyboistych ścieżkach, marząc o czymś więcej niż "
+            "codzienna rutyna udoju. Widział, jak przyjaciele tracili wszystko na fałszywych tokenach, "
+            "a rywale budowali imperia na kłamstwach.\n\n"
+            "⚡ **Moment przemiany:**\n"
+            "Pewnej mroźnej nocy wszystko się zmieniło. Atak gangu Czarnej Serwatki zmienił "
+            "w Niszczyciela Mleka w bezlitosnego Don Mleko.\n\n"
+            "🔄 **Z Milo w Don Mleko:** Od dostawcy do imperatora\n\n"
+            f"💎 +3 punkty za poznanie początków! Masz: {points}"
+        )
+
+        await update.message.reply_text(historia_text, parse_mode='Markdown')
+    except Exception as e:
+        logging.error(f"Błąd w historia_milo: {e}")
+        await update.message.reply_text("❌ Błąd w historii Milo!")
+
+async def zdradca_kefir(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Historia zdrajcy Kefira"""
+    try:
+        user_id = update.effective_user.id
+        points, success = add_points_with_limit(user_id, 4)
+
+        historia_text = (
+            "🔴 **KEFIR - WIELKA ZDRADA**\n\n"
+            "Kefir był kiedyś najbliższym przyjacielem Don Mleko. Razem budowali imperium, "
+            "razem walczyli z wrogami. Ale władza korumpuje...\n\n"
+            "💔 **Zdrada:**\n"
+            "Kefir sprzedał sekrety rodziny konkurencyjnemu gangowi Jogurt Mafia. "
+            "Przekazał im lokalizacje składów, plany operacji i listę zaufanych członków.\n\n"
+            "⚔️ **Konsekwencje:**\n"
+            "Gdy Don Mleko odkrył zdradę, jego gniew był straszliwy. Kefir został wygnany "
+            "na zawsze, a jego imię stało się synonimem zdrady w rodzinie.\n\n"
+            "⚠️ **Lekcja:** W rodzinie Don Mleko lojalność jest wszystkim\n\n"
+            "🤵 **Motto:** 'Rodzina nie zapomina. Rodzina nie wybacza zdrajcom.'\n\n"
+            f"💎 +4 punkty za lekcję lojalności! Masz: {points}"
+        )
+
+        await update.message.reply_text(historia_text, parse_mode='Markdown')
+    except Exception as e:
+        logging.error(f"Błąd w zdradca_kefir: {e}")
+        await update.message.reply_text("❌ Błąd w historii zdrajcy!")
+
+# === SYSTEM DAILY REWARDS ===
+async def daily_reward(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """System codziennych nagród z streak systemem"""
+    try:
+        user_id = update.effective_user.id
+        user_data = get_user_data_full(user_id)
+
+        # Sprawdź rate limiting
+        can_proceed, message = check_rate_limit(user_id, "daily")
+        if not can_proceed:
+            await update.message.reply_text(f"❌ {message}")
+            return
+
+        now = time.time()
+        last_daily = user_data.get('last_daily', 0)
+        daily_streak = user_data.get('daily_streak', 0)
+
+        # Sprawdź czy już odebrał dzisiaj
+        if now - last_daily < 86400:  # 24 godziny
+            remaining = int(86400 - (now - last_daily))
+            hours = remaining // 3600
+            minutes = (remaining % 3600) // 60
+            seconds = remaining % 60
+
+            next_daily_time = datetime.fromtimestamp(last_daily + 86400).strftime("%H:%M")
+
+            await update.message.reply_text(
+                f"⏰ **DAILY JUŻ ODEBRANE!**\n\n"
+                f"🔥 Aktualny streak: {daily_streak} dni\n"
+                f"⏰ Następne daily za: {hours}h {minutes}m {seconds}s\n"
+                f"🕒 Dostępne o: {next_daily_time}\n\n"
+                f"🎯 **KALENDARZ DAILY:**\n"
+                f"📅 Dzień {(daily_streak % 14) + 1}/14 w cyklu\n"
+                f"💡 Co 7 dni = mega bonus!\n"
+                f"👑 Co 14 dni = ultimate bonus!"
+            )
+            return
+
+        # Sprawdź czy streak się nie zerwał (tolerance 36h)
+        if now - last_daily > 129600:  # 36 godzin - zeruj streak
+            daily_streak = 0
+
+        # Zwiększ streak
+        daily_streak += 1
+        current_day = ((daily_streak - 1) % 14) + 1
+
+        # Podstawowa nagroda
+        base_reward = DAILY_REWARDS[current_day]
+        points_reward = base_reward['points']
+
+        # Streak bonus
+        if daily_streak >= 7:
+            streak_multiplier = 1 + (daily_streak // 7) * 0.5  # +50% za każde 7 dni
+            points_reward = int(points_reward * streak_multiplier)
+
+        # Dodaj punkty
+        points = add_points(user_id, points_reward)
+
+        # Aktualizuj dane
+        user_data['last_daily'] = now
+        user_data['daily_streak'] = daily_streak
+        user_data['total_dailies'] = user_data.get('total_dailies', 0) + 1
+
+        # Sprawdź milestone rewards
+        milestone_bonus = ""
+        if daily_streak in STREAK_MILESTONES:
+            milestone = STREAK_MILESTONES[daily_streak]
+            milestone_points = milestone['reward']
+            milestone_respect = milestone['respect']
+
+            points = add_points(user_id, milestone_points)
+            user_data['mafia_respect'] = user_data.get('mafia_respect', 0) + milestone_respect
+
+            milestone_bonus = (
+                f"\n\n🎉 **MILESTONE REWARD!**\n"
+                f"🏆 {milestone['title']}\n"
+                f"💎 Bonus: +{milestone_points} DMT\n"
+                f"⭐ Bonus szacunek: +{milestone_respect}\n"
+            )
+
+        # Zastosuj specjalne bonusy
+        special_effect = ""
+        if current_day == 2 or current_day == 9:  # Mining boost
+            user_data['daily_mining_boost'] = now + 7200  # 2 godziny
+            special_effect = "\n🔥 +25% mining boost na 2h!"
+        elif current_day == 3 or current_day == 10:  # Guaranteed rare mineral
+            # Dodaj rzadki minerał
+            rare_mineral = random.choice(list(RARE_MINERALS.keys()))
+            mineral_data = RARE_MINERALS[rare_mineral]
+            mineral_bonus = mineral_data['value']
+            points = add_points(user_id, mineral_bonus)
+
+            rare_minerals = user_data.get('rare_minerals_found', {})
+            rare_minerals[rare_mineral] = rare_minerals.get(rare_mineral, 0) + 1
+            user_data['rare_minerals_found'] = rare_minerals
+
+            special_effect = f"\n💠 Znaleziono: {mineral_data['name']} (+{mineral_bonus} DMT)!"
+        elif current_day == 4 or current_day == 11:  # Gambling boost
+            user_data['daily_gambling_boost'] = now + 7200  # 2 godziny
+            special_effect = "\n🎰 +50% gambling rewards na 2h!"
+        elif current_day == 5 or current_day == 12:  # Skip cooldowns
+            for location in MINING_LOCATIONS.keys():
+                user_data[f'last_mine_{location}'] = 0
+            user_data['last_mine'] = 0
+            user_data['last_heist'] = 0
+            user_data['last_mission'] = 0
+            special_effect = "\n⚡ Wszystkie cooldowny zresetowane!"
+        elif current_day == 6 or current_day == 13:  # Respect boost
+            user_data['daily_respect_boost'] = now + 14400  # 4 godziny
+            special_effect = "\n👑 +100% respect gain na 4h!"
+        elif current_day == 7:  # Weekly mega bonus
+            mega_points = 500
+            mega_respect = 1000
+            points = add_points(user_id, mega_points)
+            user_data['mafia_respect'] = user_data.get('mafia_respect', 0) + mega_respect
+            special_effect = f"\n🎉 WEEKLY BONUS! +{mega_points} DMT +{mega_respect} respect!"
+        elif current_day == 14:  # Ultimate bonus
+            ultra_points = 750
+            ultra_respect = 2000
+            points = add_points(user_id, ultra_points)
+            user_data['mafia_respect'] = user_data.get('mafia_respect', 0) + ultra_respect
+            user_data['mining_level'] = user_data.get('mining_level', 1) + 1
+            special_effect = f"\n👑 ULTIMATE BONUS! +{ultra_points} DMT +{ultra_respect} respect +mining level!"
+
+        # Sprawdź odznaki
+        if daily_streak >= 7:
+            check_and_award_badge(user_id, "daily_warrior")
+
+        update_user_data(user_id, user_data)
+
+        # Emotikony na podstawie dnia
+        day_emojis = {
+            1: "🌅", 2: "⛏️", 3: "💎", 4: "🎰", 5: "⚡", 6: "👑", 7: "🔥",
+            8: "🌅", 9: "⛏️", 10: "💎", 11: "🎰", 12: "⚡", 13: "👑", 14: "🏆"
+        }
+
+        # Progress bar dla streak
+        progress_14 = "█" * (current_day) + "░" * (14 - current_day)
+
+        # Auto-post dla długich streak
+        if daily_streak in [7, 14, 30, 100]:
+            username = update.effective_user.first_name or f"Gracz{str(user_id)[-4:]}"
+            auto_create_achievement_post(user_id, username, 'milestone', f"{daily_streak} dni streak!")
+
+        await update.message.reply_text(
+            f"{day_emojis[current_day]} **DAILY REWARD ODEBRANE!**\n\n"
+            f"📅 **Dzień {current_day}/14** w cyklu\n"
+            f"🔥 **Streak:** {daily_streak} dni z rzędu\n"
+            f"📊 **Progress:** {progress_14} {int(current_day/14*100)}%\n\n"
+            f"🎁 **NAGRODA:**\n"
+            f"💎 +{points_reward} DMT\n"
+            f"🎯 {base_reward['bonus']}\n"
+            f"{special_effect}\n"
+            f"{milestone_bonus}\n"
+            f"💰 **Łącznie punktów:** {points:,}\n\n"
+            f"⏰ **Następne daily:** za 24h\n"
+            f"💡 **Tip:** Nie przegap dnia aby utrzymać streak!"
+        )
+
+    except Exception as e:
+        logging.error(f"Błąd w daily_reward: {e}")
+        await update.message.reply_text("❌ Błąd w daily rewards!")
+
+# === CALLBACK HANDLERS ===
+async def territory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.effective_user.id
+        user_data = get_user_data_full(user_id)
+
+        # Sprawdź rate limiting
+        can_proceed, message = check_rate_limit(user_id, "territory")
+        if not can_proceed:
+            await update.message.reply_text(f"❌ {message}")
+            return
+
+        if not context.args:
+            territory_owned = user_data.get('territory_owned', 0)
+            user_points = user_data.get('points', 0)
+
+            territories_text = "🏰 **DOSTĘPNE TERYTORIUM:**\n\n"
+            territories_text += f"💎 Twoje punkty: {user_points} DMT\n"
+            territories_text += f"🏘️ Posiadasz: {territory_owned}/{len(TERRITORIES)} terytorium\n\n"
+
+            total_income = 0
+
+            # Pokaż wszystkie terytoria - grupowane dla lepszej czytelności
+            territories_text += "📋 **WSZYSTKIE TERYTORIA:**\n\n"
+
+            # Podziel na grupy po 5 dla lepszej czytelności
+            for i, territory in enumerate(TERRITORIES, 1):
+                if i <= territory_owned:
+                    status = "✅ POSIADANE"
+                    total_income += territory['income']
+                    status_emoji = "✅"
+                elif i == territory_owned + 1:
+                    if user_points >= territory['cost']:
+                        status = "💚 MOŻESZ KUPIĆ"
+                        status_emoji = "💚"
+                    else:
+                        status = f"💰 POTRZEBUJESZ {territory['cost'] - user_points:,} DMT"
+                        status_emoji = "💰"
+                else:
+                    status = "🔒 ZABLOKOWANE"
+                    status_emoji = "🔒"
+
+                territories_text += (
+                    f"{status_emoji} {i}. **{territory['name']}**\n"
+                    f"   🏢 {territory['type']} | 💰 {territory['cost']:,} DMT | 📈 +{territory['income']} DMT/h\n"
+                    f"   📊 {status}\n\n"
+                )
+
+                # Dodaj separator co 10 terytorii dla lepszej czytelności
+                if i % 10 == 0 and i < len(TERRITORIES):
+                    territories_text += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+            territories_text += f"💰 **Łączny dochód:** {total_income} DMT/h\n\n"
+
+            # Instrukcje
+            if territory_owned < len(TERRITORIES):
+                next_territory = TERRITORIES[territory_owned]
+                territories_text += "🎯 **NASTĘPNE DO KUPIENIA:**\n"
+                territories_text += f"   {territory_owned + 1}. {next_territory['name']} - {next_territory['cost']} DMT\n\n"
+            else:
+                territories_text += "🎉 **GRATULACJE!** Posiadasz wszystkie terytoria!\n\n"
+
+            territories_text += "Użyj: `/territory [numer]` aby kupić terytorium\n"
+            territories_text += "💡 Terytoria kupujesz po kolei!"
+
+            await update.message.reply_text(territories_text, parse_mode='Markdown')
+            return
+
+        try:
+            territory_id = int(context.args[0]) - 1
+            if territory_id < 0 or territory_id >= len(TERRITORIES):
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text(f"❌ Podaj prawidłowy numer terytorium (1-{len(TERRITORIES)})!")
+            return
+
+        territory_owned = user_data.get('territory_owned', 0)
+
+        if territory_id < territory_owned:
+            await update.message.reply_text("❌ To terytorium już posiadasz!")
+            return
+
+        if territory_id != territory_owned:
+            await update.message.reply_text("❌ Musisz kupować terytorium po kolei!")
+            return
+
+        territory = TERRITORIES[territory_id]
+        points = user_data.get('points', 0)
+
+        if points < territory['cost']:
+            await update.message.reply_text(f"❌ Potrzebujesz {territory['cost']} DMT aby kupić {territory['name']}!\n💎 Masz: {points} DMT")
+            return
+
+        # Kup terytorium - odejmij koszt TYLKO JEDEN RAZ
+        final_points = add_points(user_id, -territory['cost'])
+
+        # Zaktualizuj dane terytorium
+        updated_user_data = get_user_data_full(user_id)  # Pobierz świeże dane
+        updated_user_data['territory_owned'] = territory_owned + 1
+        updated_user_data['last_territory_income'] = time.time()
+        update_user_data(user_id, updated_user_data)
+
+        # Pobierz aktualne punkty po zakupie (już są poprawne z add_points)
+        new_points = final_points
+
+        # Sprawdź odznakę
+        if user_data['territory_owned'] >= 3:
+            check_and_award_badge(user_id, "territory_king")
+
+        total_income = sum(TERRITORIES[i]['income'] for i in range(user_data['territory_owned']))
+
+        await update.message.reply_text(
+            f"🏰 **TERYTORIUM ZDOBYTE!**\n\n"
+            f"📍 Kupiono: **{territory['name']}**\n"
+            f"🏢 Typ: {territory['type']}\n"
+            f"💸 Koszt: {territory['cost']} DMT\n"
+            f"📈 Nowy dochód: +{territory['income']} DMT/h\n"
+            f"💰 Łączny dochód: {total_income} DMT/h\n"
+            f"💎 Pozostało punktów: {new_points}\n\n"
+            f"🏰 Posiadasz {user_data['territory_owned']}/{len(TERRITORIES)} terytorium!\n\n"
+            f"💡 Możesz teraz zbierać haracze co godzinę!"
+        )
+
+    except Exception as e:
+        logging.error(f"Błąd w territory: {e}")
+        await update.message.reply_text("❌ Błąd w systemie terytorium!")
+
+async def protection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.effective_user.id
+        user_data = get_user_data_full(user_id)
+
+        # Sprawdź rate limiting
+        can_proceed, message = check_rate_limit(user_id, "protection")
+        if not can_proceed:
+            await update.message.reply_text(f"❌ {message}")
+            return
+
+        territory_owned = user_data.get('territory_owned', 0)
+
+        if territory_owned == 0:
+            await update.message.reply_text(
+                "❌ **BRAK TERYTORIUM!**\n\n"
+                "🏰 Musisz posiadać terytorium aby zbierać haracze!\n\n"
+                "💡 **JAK ZDOBYĆ TERYTORIUM:**\n"
+                "📍 `/territory` - zobacz dostępne tereny\n"
+                "📍 `/territory 1` - kup pierwszą dzielnicę (500 DMT)\n\n"
+                "🎯 **KORZYŚCI:**\n"
+                "• Pasywny dochód co godzinę\n"
+                "• Bonus za rangę mafijną\n"
+                "• Możliwość budowy specjalnych budynków"
+            )
+            return
+
+        # Inicjalizuj last_territory_income jeśli nie istnieje
+        if 'last_territory_income' not in user_data:
+            user_data['last_territory_income'] = time.time()
+            update_user_data(user_id, user_data)
+
+        last_collection = user_data.get('last_territory_income', time.time())
+        now = time.time()
+        hours_passed = (now - last_collection) / 3600
+
+        # Minimalno 1 godzina między zbiorami
+        if hours_passed < 1.0:
+            remaining = int(3600 - (now - last_collection))
+            minutes = remaining // 60
+            seconds = remaining % 60
+            await update.message.reply_text(
+                f"⏰ **ZBYT WCZEŚNIE!**\n\n"
+                f" Czas akumulacji: {int(hours_passed)}h\n"
+                f"🔸 Następny haracz za: {minutes}m {seconds}s\n\n"
+                f"🏰 Twoje terytorium: {territory_owned}/{len(TERRITORIES)}\n"
+                f"💰 Dochód/godzina: {sum(TERRITORIES[i]['income'] for i in range(territory_owned))} DMT"
+            )
+            return
+
+        # Oblicz dochód
+        hourly_income = sum(TERRITORIES[i]['income'] for i in range(territory_owned))
+        max_hours = min(24, int(hours_passed))  # Maksymalnie 24h akumulacji
+        base_income = hourly_income * max_hours
+
+        # Dodaj bonus za rangę mafijną
+        respect = user_data.get('mafia_respect', 0)
+        rank = get_mafia_rank(respect)
+        bonus_percent = MAFIA_RANKS[rank]['bonus']
+        bonus_income = int(base_income * bonus_percent / 100)
+        total_income = base_income + bonus_income
+
+        # Dodaj bonusy z budynków specjalnych
+        special_buildings = user_data.get('special_buildings', [])
+        building_bonus = 0
+
+        if 'cyber_centrum' in special_buildings:
+            building_bonus += int(total_income * 0.4)  # +40%
+        if 'rakieta_don_mleko' in special_buildings:
+            building_bonus += int(total_income * 1.0)  # +100%
+        if 'forteca_mleka' in special_buildings:
+            building_bonus += int(total_income * 0.5)  # +50%
+
+        final_income = total_income + building_bonus
+
+        # Dodaj punkty i zaktualizuj dane
+        points = add_points(user_id, final_income)
+
+        # Zaktualizuj dane haraczy
+        user_data['last_territory_income'] = now
+        user_data['protection_money'] = user_data.get('protection_money', 0) + final_income
+        update_user_data(user_id, user_data)
+
+        # Przygotuj tekst wyniku
+        result_text = (
+            f"💰 **HARACZE ZEBRANE!**\n\n"
+            f"🏰 Terytorium: {territory_owned}/{len(TERRITORIES)}\n"
+            f"⏰ Czas akumulacji: {max_hours}h\n"
+            f"📊 Dochód bazowy: {hourly_income}/h × {max_hours}h = {base_income} DMT\n"
+        )
+
+        if bonus_income > 0:
+            result_text += f"👑 Bonus za rangę ({rank}): +{bonus_income} DMT\n"
+
+        if building_bonus > 0:
+            result_text += f"🏗️ Bonus z budynków: +{building_bonus} DMT\n"
+
+        result_text += (
+            f"💎 **ŁĄCZNIE: {final_income} DMT**\n"
+            f"🏦 Masz teraz: {points} punktów\n"
+            f"📈 Całkowite haracze: {user_data['protection_money']:,} DMT\n\n"
+            f"🤵 Następny zbiór za 1 godzinę!"
+        )
+
+        await update.message.reply_text(result_text, parse_mode='Markdown')
+
+    except Exception as e:
+        logging.error(f"Błąd w protection: {e}")
+        await update.message.reply_text("❌ Błąd w systemie haraczy! Spróbuj ponownie za chwilę.")
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        query = update.callback_query
+        await query.answer()
+
+        user_id = query.from_user.id
+        user_data = get_user_data_full(user_id)
+
+        if query.data == "missions":
+            user_data = get_user_data_full(user_id)
+            last_mission = user_data.get('last_mission', 0)
+            now = time.time()
+            respect = user_data.get('mafia_respect', 0)
+            rank = get_mafia_rank(respect)
+            user_points = user_data.get('points', 0)
+
+            missions_text = "🎯 **DOSTĘPNE MISJE MAFII:**\n\n"
+            missions_text += f"👤 Twoja ranga: {rank}\n"
+            missions_text += f"💎 Twoje punkty: {user_points} DMT\n"
+            missions_text += f"⭐ Szacunek: {respect}\n\n"
+
+            if now - last_mission < 1800:  # 30 minut cooldown
+                remaining = int(1800 - (now - last_mission))
+                missions_text += f"⏰ Następna misja za {remaining//60}m {remaining%60}s!\n\n"
+
+            # Podziel misje na grupy po trudności
+            missions_by_difficulty = {
+                'Łatwe': [],
+                'Średnie': [],
+                'Trudne': [],
+                'Eksperckie': []
+            }
+
+            for i, mission in enumerate(MISSIONS, 1):
+                success_bonus = MAFIA_RANKS[rank]['bonus']
+                base_chance = {
+                    'łatwy': 80,
+                    'średni': 60,
+                    'trudny': 40,
+                    'bardzo trudny': 20,
+                    'ekspert': 15,
+                    'legendarna': 10,
+                    'mityczna': 5,
+                    'boski': 3,
+                    'transcendentny': 1
+                }
+                success_chance = min(95, base_chance.get(mission['difficulty'], 50) + success_bonus)
+
+                if mission['difficulty'] in ['łatwy']:
+                    category = 'Łatwe'
+                elif mission['difficulty'] in ['średni']:
+                    category = 'Średnie'
+                elif mission['difficulty'] in ['trudny', 'bardzo trudny']:
+                    category = 'Trudne'
+                else:
+                    category = 'Eksperckie'
+
+                missions_by_difficulty[category].append((i, mission, success_chance))
+
+            # Utwórz przyciski dla kategorii misji
+            keyboard = []
+
+            # Dodaj przyciski kategorii misji
+            if missions_by_difficulty['Łatwe']:
+                keyboard.append([InlineKeyboardButton(
+                    f"🟢 Misje Łatwe ({len(missions_by_difficulty['Łatwe'])})",
+                    callback_data="missions_easy"
+                )])
+
+            if missions_by_difficulty['Średnie']:
+                keyboard.append([InlineKeyboardButton(
+                    f"🟡 Misje Średnie ({len(missions_by_difficulty['Średnie'])})",
+                    callback_data="missions_medium"
+                )])
+
+            if missions_by_difficulty['Trudne']:
+                keyboard.append([InlineKeyboardButton(
+                    f"🟠 Misje Trudne ({len(missions_by_difficulty['Trudne'])})",
+                    callback_data="missions_hard"
+                )])
+
+            if missions_by_difficulty['Eksperckie']:
+                keyboard.append([InlineKeyboardButton(
+                    f"🔴 Misje Eksperckie ({len(missions_by_difficulty['Eksperckie'])})",
+                    callback_data="missions_expert"
+                )])
+
+            # Przycisk powrotu
+            keyboard.append([InlineKeyboardButton("🔙 Powrót do Mafii", callback_data="back_to_mafia")])
+
+            missions_text += (
+                "📋 **Wybierz kategorię misji:**\n\n"
+                "🟢 **Łatwe** - Wysokie szanse powodzenia\n"
+                "🟡 **Średnie** - Umiarkowane ryzyko\n"
+                "🟠 **Trudne** - Wysokie ryzyko, wysokie nagrody\n"
+                "🔴 **Eksperckie** - Ekstremalnie trudne, legendarne nagrody\n\n"
+                "💡 Twoja ranga wpływa na szanse powodzenia!"
+            )
+
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                missions_text,
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+
+        elif query.data == "territory":
+            territory_owned = user_data.get('territory_owned', 0)
+            total_income = sum(TERRITORIES[i]['income'] for i in range(territory_owned)) if territory_owned > 0 else 0
+            user_points = user_data.get('points', 0)
+
+            # Pokaż pierwsze 5 terytorium z opcjami kupna
+            territory_text = "🏰 **SYSTEM TERYTORIUM**\n\n"
+            territory_text += f"📍 Posiadasz: {territory_owned}/{len(TERRITORIES)} terytorium\n"
+            territory_text += f"💰 Dochód: {total_income} DMT/godzina\n"
+            territory_text += f"💎 Twoje punkty: {user_points} DMT\n\n"
+
+            territory_text += "**DOSTĘPNE TERYTORIUM:**\n"
+
+            # Przyciski dla terytorium
+            keyboard = []
+
+            # Pokaż następne 3 dostępne terytoria
+            for i in range(territory_owned, min(territory_owned + 3, len(TERRITORIES))):
+                territory = TERRITORIES[i]
+                if user_points >= territory['cost']:
+                    status = f"✅ Kup za {territory['cost']} DMT"
+                    keyboard.append([InlineKeyboardButton(
+                        f"🏢 {territory['name']} ({territory['cost']} DMT)",
+                        callback_data=f"buy_territory_{i}"
+                    )])
+                else:
+                    status = f"❌ Potrzebujesz {territory['cost']} DMT"
+
+                territory_text += (
+                    f"{i+1}. **{territory['name']}**\n"
+                    f"   💰 Koszt: {territory['cost']} DMT\n"
+                    f"   📈 Dochód: +{territory['income']} DMT/h\n"
+                    f"   📊 Status: {status}\n\n"
+                )
+
+            # Dodaj przyciski nawigacyjne
+            if territory_owned > 0:
+                keyboard.append([InlineKeyboardButton("🛡️ Zbierz Haracze", callback_data="protection")])
+
+            keyboard.append([InlineKeyboardButton("🔙 Powrót do Mafii", callback_data="back_to_mafia")])
+
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            if territory_owned >= len(TERRITORIES):
+                territory_text += "👑 **GRATULACJE! Posiadasz całe miasto!**"
+            else:
+                territory_text += "💡 **Informacja:** Terytorium kupujesz po kolei.\n"
+                territory_text += f"🎯 Następne: {TERRITORIES[territory_owned]['name']} za {TERRITORIES[territory_owned]['cost']} DMT"
+
+            await query.edit_message_text(
+                territory_text,
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+
+        elif query.data == "heist":
+            last_heist = user_data.get('last_heist', 0)
+            now = time.time()
+
+            if now - last_heist < 3600:
+                remaining = int(3600 - (now - last_heist))
+                await query.edit_message_text(
+                    f"💰 **SYSTEM NAPADÓW**\n\n"
+                    f"⏰ Następny napad za: {remaining//60}m {remaining%60}s\n\n"
+                    f"💸 Koszt przygotowania: 100 DMT\n"
+                    f"💰 Potencjalna nagroda: 500-2000 DMT\n"
+                    f"⭐ Szacunek za udany napad: +75\n\n"
+                    f"🎯 Szanse zależą od Twojej rangi w mafii!",
+                    parse_mode='Markdown'
+                )
+            else:
+                await query.edit_message_text(
+                    "💰 **SYSTEM NAPADÓW**\n\n"
+                    "✅ Napad dostępny!\n\n"
+                    "💸 Koszt przygotowania: 100 DMT\n"
+                    "💰 Potencjalna nagroda: 500-2000 DMT\n"
+                    "⭐ Szacunek za udany napad: +75\n\n"
+                    "Użyj: `/heist` aby rozpocząć napad!",
+                    parse_mode='Markdown'
+                )
+
+        elif query.data == "protection":
+            territory_owned = user_data.get('territory_owned', 0)
+
+            if territory_owned == 0:
+                keyboard = [[InlineKeyboardButton("🏰 Zobacz Terytorium", callback_data="territory")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+
+                await query.edit_message_text(
+                    "🛡️ **SYSTEM HARACZY**\n\n"
+                    "❌ Nie masz żadnego terytorium!\n\n"
+                    "🏰 Musisz kupić terytorium aby zbierać haracze\n"
+                    "💡 Pierwsze terytorium kosztuje 500 DMT\n"
+                    "📈 Daje pasywny dochód co godzinę!\n\n"
+                    "👇 Kliknij przycisk poniżej:",
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+            else:
+                last_collection = user_data.get('last_territory_income', time.time())
+                now = time.time()
+                hours_passed = (now - last_collection) / 3600
+
+                # Dodaj przyciski akcji
+                if hours_passed >= 1:
+                    potential_income = int(sum(TERRITORIES[i]['income'] for i in range(territory_owned)) * min(24, int(hours_passed)))
+                    keyboard = [
+                        [InlineKeyboardButton("💰 Zbierz Haracze", callback_data="collect_protection")],
+                        [InlineKeyboardButton("🏰 Zobacz Terytorium", callback_data="territory")]
+                    ]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+
+                    await query.edit_message_text(
+                        f"🛡️ **SYSTEM HARACZY**\n\n"
+                        f"✅ Haracze dostępne!\n\n"
+                        f"🏰 Terytorium: {territory_owned}/{len(TERRITORIES)}\n"
+                        f"💰 Dochód: {sum(TERRITORIES[i]['income'] for i in range(territory_owned))} DMT/h\n"
+                        f"⏰ Czas akumulacji: {int(hours_passed)}h\n"
+                        f"💎 Do zebrania: ~{potential_income} DMT\n\n"
+                        f"👇 Kliknij aby zebrać:",
+                        reply_markup=reply_markup,
+                        parse_mode='Markdown'
+                    )
+                else:
+                    remaining = int(3600 - (now - last_collection))
+                    keyboard = [[InlineKeyboardButton("🏰 Zobacz Terytorium", callback_data="territory")]]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+
+                    await query.edit_message_text(
+                        f"🛡️ **SYSTEM HARACZY**\n\n"
+                        f"⏰ Następne haracze za: {remaining//60}m {remaining%60}s\n\n"
+                        f"🏰 Terytorium: {territory_owned}/{len(TERRITORIES)}\n"
+                        f"💰 Dochód: {sum(TERRITORIES[i]['income'] for i in range(territory_owned))} DMT/h\n\n"
+                        f"💡 Haracze można zbierać co godzinę!",
+                        reply_markup=reply_markup,
+                        parse_mode='Markdown'
+                    )
+
+        elif query.data == "recruitment":
+            recruited = user_data.get('recruited_members', [])
+            recruited_by = user_data.get('recruited_by', None)
+            user_rank = get_mafia_rank(user_data.get('mafia_respect', 0))
+
+            recruitment_text = "👥 **SYSTEM WERBOWANIA**\n\n"
+
+            if can_recruit(user_id):
+                bonus = get_recruitment_bonus(user_rank)
+                recruitment_text += (
+                    f"✅ Możesz werbować nowych członków!\n"
+                    f"💰 Bonus za werbowanie: {bonus} DMT\n"
+                    f"🎯 Zwerbowani przez Ciebie: {len(recruited)}\n\n"
+                    f"**INSTRUKCJA:**\n"
+                    f"Nowy gracz: `/recruit {update.effective_user.username or user_id}`\n\n"
+                )
+            else:
+                recruitment_text += (
+                    "❌ Potrzebujesz rangi Capo aby werbować\n"
+                    "📈 Wymagane: 300+ szacunek\n\n"
+                )
+
+            if recruited_by:
+                recruitment_text += f"👤 Zostałeś zwerbowany przez: {recruited_by}\n"
+
+            recruitment_text += "🤵 Użyj: `/recruit` aby zobaczyć więcej"
+
+            await query.edit_message_text(recruitment_text, parse_mode='Markdown')
+
+        elif query.data == "chat":
+            channels = user_data.get('chat_channels', ['rodzina'])
+            messages_count = user_data.get('message_count', 0)
+
+            chat_text = "💬 **SYSTEM KOMUNIKACJI**\n\n"
+            chat_text += f"📱 Dostępne kanały: {len(channels)}\n"
+            chat_text += f"💭 Wysłane wiadomości: {messages_count}\n\n"
+
+            chat_text += "**TWOJE KANAŁY:**\n"
+            for channel in channels:
+                if channel in CHAT_CHANNELS:
+                    chat_text += f"• {CHAT_CHANNELS[channel]['name']}\n"
+
+            chat_text += (
+                "\n**INSTRUKCJA:**\n"
+                "📝 `/chat [kanał] [wiadomość]` - wyślij wiadomość\n"
+                "👀 `/chat [kanał]` - zobacz ostatnie wiadomości\n"
+                "📋 `/chat` - lista kanałów"
+            )
+
+            await query.edit_message_text(chat_text, parse_mode='Markdown')
+
+        elif query.data == "bosses":
+            bosses_text = "👑 **BOSSOWIE MAFII**\n\n"
+
+            for boss_id, boss_info in MAFIA_BOSSES.items():
+                bosses_text += (
+                    f"{boss_info['name']}\n"
+                    f"👔 {boss_info['title']}\n"
+                    f"⭐ Szacunek: {boss_info['respect']:,}\n"
+                    f"📝 {boss_info['description']}\n"
+                    f"🔥 {boss_info['special_power']}\n\n"
+                )
+
+            bosses_text += (
+                "**HIERARCHIA:**\n"
+                "🐄 Don Mleko (Boss wszystkich bossów)\n"
+                "🦌 Biały Rogacz (Prawa ręka)\n"
+                "🩸🐄 Krwawa Krowa (Egzekutor)\n"
+                "👻 Milk Phantom (Szpieg)\n\n"
+                "🎯 Użyj: `/bosses` aby zobaczyć szczegóły"
+            )
+
+            await query.edit_message_text(bosses_text, parse_mode='Markdown')
+
+        elif query.data == "collect_protection":
+            # Wykonaj zbieranie haraczy przez przycisk
+            territory_owned = user_data.get('territory_owned', 0)
+
+            if territory_owned == 0:
+                await query.answer("❌ Nie masz terytorium!", show_alert=True)
+                return
+
+            last_collection = user_data.get('last_territory_income', time.time())
+            now = time.time()
+            hours_passed = (now - last_collection) / 3600
+
+            if hours_passed < 1.0:
+                remaining = int(3600 - (now - last_collection))
+                await query.answer(f"⏰ Musisz poczekać {remaining//60}m {remaining%60}s!", show_alert=True)
+                return
+
+            # Oblicz dochód (podobnie jak w funkcji protection)
+            hourly_income = sum(TERRITORIES[i]['income'] for i in range(territory_owned))
+            max_hours = min(24, int(hours_passed))
+            base_income = hourly_income * max_hours
+
+            # Bonus za rangę mafijną
+            respect = user_data.get('mafia_respect', 0)
+            rank = get_mafia_rank(respect)
+            bonus_percent = MAFIA_RANKS[rank]['bonus']
+            bonus_income = int(base_income * bonus_percent / 100)
+            total_income = base_income + bonus_income
+
+            # Bonusy z budynków specjalnych
+            special_buildings = user_data.get('special_buildings', [])
+            building_bonus = 0
+
+            if 'cyber_centrum' in special_buildings:
+                building_bonus += int(total_income * 0.4)
+            if 'rakieta_don_mleko' in special_buildings:
+                building_bonus += int(total_income * 1.0)
+            if 'forteca_mleka' in special_buildings:
+                building_bonus += int(total_income * 0.5)
+
+            final_income = total_income + building_bonus
+
+            # Dodaj punkty i zaktualizuj dane
+            points = add_points(user_id, final_income)
+
+            user_data['last_territory_income'] = now
+            user_data['protection_money'] = user_data.get('protection_money', 0) + final_income
+            update_user_data(user_id, user_data)
+
+            # Pokaż wynik
+            keyboard = [
+                [InlineKeyboardButton("🏰 Zobacz Terytorium", callback_data="territory")],
+                [InlineKeyboardButton("🔙 Powrót do Mafii", callback_data="back_to_mafia")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                f"💰 **HARACZE ZEBRANE!**\n\n"
+                f"🏰 Terytorium: {territory_owned}/{len(TERRITORIES)}\n"
+                f"⏰ Czas akumulacji: {max_hours}h\n"
+                f"📊 Dochód bazowy: {base_income} DMT\n" +
+                (f"👑 Bonus za rangę ({rank}): +{bonus_income} DMT\n" if bonus_income > 0 else "") +
+                (f"🏗️ Bonus z budynków: +{building_bonus} DMT\n" if building_bonus > 0 else "") +
+                f"💎 **ŁĄCZNIE: {final_income} DMT**\n"
+                f"🏦 Masz teraz: {points} punktów\n\n"
+                f"🤵 Następny zbiór za 1 godzinę!",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+
+        elif query.data.startswith("buy_territory_"):
+            # Obsługa kupna terytorium przez przycisk
+            try:
+                territory_id = int(query.data.split("_")[-1])
+            except ValueError:
+                await query.answer("❌ Błąd w ID terytorium!", show_alert=True)
+                return
+
+            territory_owned = user_data.get('territory_owned', 0)
+            user_points = user_data.get('points', 0)
+
+            # Sprawdź czy może kupić to terytorium
+            if territory_id != territory_owned:
+                await query.answer("❌ Musisz kupować terytorium po kolei!", show_alert=True)
+                return
+
+            if territory_id >= len(TERRITORIES):
+                await query.answer("❌ Nieprawidłowe terytorium!", show_alert=True)
+                return
+
+            territory = TERRITORIES[territory_id]
+
+            if user_points < territory['cost']:
+                await query.answer(f"❌ Potrzebujesz {territory['cost']} DMT!", show_alert=True)
+                return
+
+            # Kup terytorium - odejmij koszt TYLKO JEDEN RAZ
+            final_points = add_points(user_id, -territory['cost'])
+
+            # Zaktualizuj dane używając świeżych danych
+            fresh_user_data = get_user_data_full(user_id)
+            fresh_user_data['territory_owned'] = territory_owned + 1
+            fresh_user_data['last_territory_income'] = time.time()
+            update_user_data(user_id, fresh_user_data)
+
+            # Pobierz aktualne punkty po zakupie (już są poprawne)new_points = final_points
+
+            # Sprawdź odznakę
+            if user_data['territory_owned'] >= 3:
+                check_and_award_badge(user_id, "territory_king")
+
+            total_income = sum(TERRITORIES[i]['income'] for i in range(user_data['territory_owned']))
+
+            # Pokaż wynik zakupu
+            keyboard = [
+                [InlineKeyboardButton("🏰 Zobacz Terytorium", callback_data="territory")],
+                [InlineKeyboardButton("🛡️ Zbierz Haracze", callback_data="protection")],
+                [InlineKeyboardButton("🔙 Powrót do Mafii", callback_data="back_to_mafia")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                f"🏰 **TERYTORIUM ZDOBYTE!**\n\n"
+                f"📍 Kupiono: **{territory['name']}**\n"
+                f"🏢 Typ: {territory['type']}\n"
+                f"💸 Koszt: {territory['cost']} DMT\n"
+                f"📈 Nowy dochód: +{territory['income']} DMT/h\n"
+                f"💰 Łączny dochód: {total_income} DMT/h\n"
+                f"💎 Pozostało punktów: {new_points}\n\n"
+                f"🏰 Posiadasz {user_data['territory_owned']}/{len(TERRITORIES)} terytorium!\n\n"
+                f"💡 Możesz teraz zbierać haracze co godzinę!",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+
+        elif query.data == "back_to_mafia":
+            # Powrót do głównego menu mafii
+            respect = user_data.get('mafia_respect', 0)
+            rank = get_mafia_rank(respect)
+
+            keyboard = [
+                [InlineKeyboardButton("🎯 Misje", callback_data="missions")],
+                [InlineKeyboardButton("🏰 Terytorium", callback_data="territory")],
+                [InlineKeyboardButton("💰 Napad", callback_data="heist")],
+                [InlineKeyboardButton("🛡️ Haracze", callback_data="protection")],
+                [InlineKeyboardButton("👥 Werbowanie", callback_data="recruitment"), InlineKeyboardButton("💬 Czat", callback_data="chat")],
+                [InlineKeyboardButton("🎲 Gry Mafii", callback_data="mafia_games")],
+                [InlineKeyboardButton("👑 Bossowie", callback_data="bosses")],
+                [InlineKeyboardButton("📊 Status mafii", callback_data="mafia_status")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                f"🤵 **RODZINA MAFII DON MLEKO**\n\n"
+                f"👤 Twoja ranga: **{rank}**\n"
+                f"⭐ Szacunek: {respect}\n"
+                f"💰 Bonus za rangę: +{MAFIA_RANKS[rank]['bonus']}%\n\n"
+                f"🎯 Wybierz akcję:",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+
+        elif query.data == "mafia_status":
+            respect = user_data.get('mafia_respect', 0)
+            rank = get_mafia_rank(respect)
+            contracts = user_data.get('contracts_completed', 0)
+            territory = user_data.get('territory_owned', 0)
+            total_protection = user_data.get('protection_money', 0)
+            recruited = len(user_data.get('recruited_members', []))
+            messages = user_data.get('message_count', 0)
+
+            await query.edit_message_text(
+                f"📊 **TWÓJ STATUS W MAFII**\n\n"
+                f"👤 Ranga: **{rank}**\n"
+                f"⭐ Szacunek: {respect}\n"
+                f"🎯 Wykonane kontrakty: {contracts}\n"
+                f"🏰 Posiadane terytorium: {territory}/{len(TERRITORIES)}\n"
+                f"💰 Łączne haracze: {total_protection} DMT\n"
+                f"👥 Zwerbowani członkowie: {recruited}\n"
+                f"💬 Wysłane wiadomości: {messages}\n"
+                f"🔥 Bonus za rangę: +{MAFIA_RANKS[rank]['bonus']}%\n\n"
+                f"💡 Im wyższa ranga, tym większe szanse w misjach!",
+                parse_mode='Markdown'
+            )
+
+        elif query.data == "mafia_games":
+            # Menu gier mafii
+            user_points = user_data.get('points', 0)
+
+            games_text = (
+                f"🎲 **GIER MAFII DON MLEKO**\n\n"
+                f"💎 Twoje punkty: {user_points} DMT\n\n"
+                f"**DOSTĘPNE GIER:**\n"
+                f"🃏 **Blackjack** - Klasyczna gra 21\n"
+                f"🎲 **Kości** - Zgadnij sumę dwóch kości\n"
+                f"🚀 **Crash** - Rakieta do gwiazd\n"
+                f"🎡 **Koło Fortuny** - Mega jackpoty\n\n"
+                f"🤵 **Bonusy mafijne aktywne!**"
+            )
+
+            keyboard = [
+                [InlineKeyboardButton("🃏 Blackjack", callback_data="game_blackjack")],
+                [InlineKeyboardButton("🎲 Kości", callback_data="game_dice")],
+                [InlineKeyboardButton("🚀 Crash Game", callback_data="game_crash")],
+                [InlineKeyboardButton("🎡 Koło Fortuny", callback_data="game_wheel")],
+                [InlineKeyboardButton("🔙 Powrót do Mafii", callback_data="back_to_mafia")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                games_text,
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+
+        # Handlery dla kategorii misji
+        elif query.data == "missions_easy":
+            await show_missions_category(query, user_data, "easy", "🟢 MISJE ŁATWE")
+        elif query.data == "missions_medium":
+            await show_missions_category(query, user_data, "medium", "🟡 MISJE ŚREDNIE")
+        elif query.data == "missions_hard":
+            await show_missions_category(query, user_data, "hard", "🟠 MISJE TRUDNE")
+        elif query.data == "missions_expert":
+            await show_missions_category(query, user_data, "expert", "🔴 MISJE EKSPERCKIE")
+
+        # Nowy handler dla start_mission_X
+        elif query.data.startswith("start_mission_"):
+            try:
+                mission_index = int(query.data.split("_")[-1]) - 1  # Poprawka: -1 bo misje są indeksowane od 1
+                if mission_index < 0 or mission_index >= len(MISSIONS):
+                    raise ValueError
+            except ValueError:
+                await query.answer("❌ Błąd w ID misji!", show_alert=True)
+                return
+
+            mission = MISSIONS[mission_index]
+
+            # Sprawdź cooldown misji
+            last_mission = user_data.get('last_mission', 0)
+            now = time.time()
+            if now - last_mission < 1800:  # 30 minut cooldown
+                remaining = int(1800 - (now - last_mission))
+                await query.answer(f"⏰ Następna misja za {remaining//60}m {remaining%60}s!", show_alert=True)
+                return
+
+            # Symulacja misji (tak jak w komendzie /missions)
+            respect = user_data.get('mafia_respect', 0)
+            rank = get_mafia_rank(respect)
+            success_bonus = MAFIA_RANKS[rank]['bonus']
+            base_chance = {
+                'łatwy': 80, 'średni': 60, 'trudny': 40, 'bardzo trudny': 20,
+                'ekspert': 15, 'legendarna': 10, 'mityczna': 5, 'boski': 3, 'transcendentny': 1
+            }
+            success_chance = min(95, base_chance.get(mission['difficulty'], 50) + success_bonus)
+
+            if random.randint(1, 100) <= success_chance:
+                reward = random.randint(*mission['reward'])
+                respect_gain = mission['respect']
+                points = add_points(user_id, reward)
+
+                user_data = get_user_data_full(user_id) # Odśwież dane
+                old_rank = get_mafia_rank(user_data.get('mafia_respect', 0))
+                user_data['mafia_respect'] = user_data.get('mafia_respect', 0) + respect_gain
+                user_data['last_mission'] = now
+                user_data['contracts_completed'] = user_data.get('contracts_completed', 0) + 1
+                update_user_data(user_id, user_data)
+
+                new_rank = get_mafia_rank(user_data['mafia_respect'])
+
+                if user_data['contracts_completed'] >= 5:
+                    check_and_award_badge(user_id, "contract_killer")
+                if new_rank == 'Don':
+                    check_and_award_badge(user_id, "mafia_boss")
+
+                rank_text = f"\n🎉 AWANS! Nowa ranga: **{new_rank}**!" if new_rank != old_rank else ""
+
+                # Przyciski po udanej misji
+                keyboard = [
+                    [InlineKeyboardButton("🎯 Powrót do Misji", callback_data="missions")],
+                    [InlineKeyboardButton("🔙 Powrót do Mafii", callback_data="back_to_mafia")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+
+                await query.edit_message_text(
+                    f"✅ **MISJA UDANA!**\n\n"
+                    f"🎯 {mission['name']}\n"
+                    f"💰 Nagroda: +{reward} DMT\n"
+                    f"⭐ Szacunek: +{respect_gain}\n"
+                    f"💎 Łącznie punktów: {points}{rank_text}\n\n"
+                    f"👤 Ranga: {new_rank} (szacunek: {user_data['mafia_respect']})",
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+            else:
+                user_data['last_mission'] = now
+                update_user_data(user_id, user_data)
+
+                # Przyciski po nieudanej misji
+                keyboard = [
+                    [InlineKeyboardButton("🎯 Powrót do Misji", callback_data="missions")],
+                    [InlineKeyboardButton("🔙 Powrót do Mafii", callback_data="back_to_mafia")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+
+                await query.edit_message_text(
+                    f"💀 **MISJA NIEUDANA!**\n\n"
+                    f"🎯 {mission['name']}\n"
+                    f"😵 Zostałeś przyłapany przez policję!\n"
+                    f"⚠️ Szansa powodzenia była: {success_chance}%\n\n"
+                    f"⏰ Spróbuj ponownie za 30 minut!",
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+
+        # === BLOCKCHAIN & DMT SHOP HANDLERS ===
+        elif query.data == "dmt_shop":
+            user_data = get_user_data_full(user_id)
+            dmt_balance = user_data.get('dmt_purchases', 0)
+            
+            if dmt_balance == 0:
+                keyboard = [
+                    [InlineKeyboardButton("🔗 Połącz Portfel", callback_data="link_wallet")],
+                    [InlineKeyboardButton("📊 Sprawdź Status", callback_data="check_blockchain")],
+                    [InlineKeyboardButton("🔙 Powrót", callback_data="back_to_main")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                await query.edit_message_text(
+                    "💎 **DMT SHOP - EKSKLUZYWNY DOSTĘP**\n\n"
+                    "❌ **BRAK DOSTĘPU!**\n\n"
+                    "🔗 **Aby uzyskać dostęp:**\n"
+                    "1. Połącz portfel BSC: `/linkwallet [adres]`\n"
+                    "2. Kup prawdziwy DMT na DEX\n"
+                    "3. Otrzymasz automatyczne nagrody\n\n"
+                    "💡 **1 kupiony DMT = 10 DMT w grze + dostęp do sklepu!**\n\n"
+                    "🔗 **Kup DMT:** https://dexscreener.com/bsc/0x1fAc48db5079567D8769c9f1c16b228DB435C018",
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+                return
+
+            # Pokaż sklep DMT z przyciskami
+            keyboard = [
+                [InlineKeyboardButton("🚀 VIP Boost (50 DMT)", callback_data="buy_dmt_1")],
+                [InlineKeyboardButton("💎 Diamond Status (100 DMT)", callback_data="buy_dmt_2")],
+                [InlineKeyboardButton("👑 Don Status (200 DMT)", callback_data="buy_dmt_3")],
+                [InlineKeyboardButton("🏗️ Instant Building (300 DMT)", callback_data="buy_dmt_4")],
+                [InlineKeyboardButton("⚡ Power Pack (500 DMT)", callback_data="buy_dmt_5")],
+                [InlineKeyboardButton("🌟 Cosmic Upgrade (1000 DMT)", callback_data="buy_dmt_6")],
+                [InlineKeyboardButton("📊 Sprawdź Status", callback_data="check_blockchain")],
+                [InlineKeyboardButton("🔙 Powrót", callback_data="back_to_main")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            shop_text = (
+                f"💎 **DMT SHOP - EKSKLUZYWNY SKLEP**\n\n"
+                f"💰 **Twoje DMT:** {dmt_balance:.2f} DMT\n"
+                f"🏅 **Status:** DMT Investor\n\n"
+                f"🛒 **DOSTĘPNE PRZEDMIOTY:**\n\n"
+                f"1. 🚀 **VIP Boost (24h)** - 50 DMT\n"
+                f"   • x2 wszystkie nagrody na 24h\n"
+                f"   • Złoty username w rankingu\n\n"
+                f"2. 💎 **Diamentowy Status** - 100 DMT\n"
+                f"   • Permanentna odznaka Diamond\n"
+                f"   • +50% do wszystkich nagród\n\n"
+                f"3. 👑 **Don Status (7 dni)** - 200 DMT\n"
+                f"   • Tytuł 'Don' przy nazwie\n"
+                f"   • Dostęp do sekretnych komend\n\n"
+                f"4. 🏗️ **Instant Building** - 300 DMT\n"
+                f"   • Postaw dowolny budynek za darmo\n"
+                f"   • Skip wszystkich wymagań\n\n"
+                f"5. ⚡ **Ultimate Power Pack** - 500 DMT\n"
+                f"   • Wszystkie boosty na 7 dni\n"
+                f"   • Reset wszystkich cooldownów\n\n"
+                f"6. 🌟 **Cosmic Upgrade** - 1000 DMT\n"
+                f"   • +100 mining levels\n"
+                f"   • +10,000 respect\n"
+                f"   • God Mode na 24h\n\n"
+                f"💡 Kliknij przycisk aby kupić lub użyj: `/dmtbuy [numer]`"
+            )
+
+            await query.edit_message_text(shop_text, reply_markup=reply_markup, parse_mode='Markdown')
+
+        elif query.data == "link_wallet":
+            keyboard = [
+                [InlineKeyboardButton("📊 Sprawdź Status", callback_data="check_blockchain")],
+                [InlineKeyboardButton("💎 DMT Shop", callback_data="dmt_shop")],
+                [InlineKeyboardButton("🔙 Powrót", callback_data="back_to_main")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(
+                "🔗 **POŁĄCZ PORTFEL BSC**\n\n"
+                "💡 **Instrukcja:**\n"
+                "1. Użyj: `/linkwallet [twój_adres_BSC]`\n"
+                "2. Bot sprawdzi Twoje transakcje DMT\n"
+                "3. Otrzymasz automatyczne nagrody\n\n"
+                "📱 **Przykład:**\n"
+                "`/linkwallet 0x742d35Cc6634C0532925a3b8D3Ac3e9C5B0dC4ae`\n\n"
+                "🎁 **Korzyści:**\n"
+                "• 1 kupiony DMT = 10 DMT w grze\n"
+                "• Dostęp do ekskluzywnego sklepu\n"
+                "• Automatyczne wykrywanie transakcji\n"
+                "• Specjalne odznaki investor\n\n"
+                "🔗 **Kup DMT:** https://dexscreener.com/bsc/0x1fAc48db5079567D8769c9f1c16b228DB435C018",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+
+        elif query.data == "check_blockchain":
+            user_data = get_user_data_full(user_id)
+            wallet = user_data.get('wallet_address', None)
+            dmt_balance = user_data.get('dmt_purchases', 0)
+            
+            keyboard = [
+                [InlineKeyboardButton("🔗 Połącz Portfel", callback_data="link_wallet")],
+                [InlineKeyboardButton("💎 DMT Shop", callback_data="dmt_shop")],
+                [InlineKeyboardButton("🔄 Odśwież", callback_data="check_blockchain")],
+                [InlineKeyboardButton("🔙 Powrót", callback_data="back_to_main")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            if not wallet:
+                blockchain_text = (
+                    "📊 **STATUS BLOCKCHAIN**\n\n"
+                    "❌ **Portfel nie połączony**\n\n"
+                    "🔗 Użyj: `/linkwallet [adres]` aby połączyć\n"
+                    "💎 DMT w grze: 0\n"
+                    "🏅 Status: Brak dostępu do sklepu\n\n"
+                    "💡 Połącz portfel aby odblokować nagrody!"
+                )
+            else:
+                linked_time = user_data.get('wallet_linked_at', time.time())
+                linked_date = datetime.fromtimestamp(linked_time).strftime('%Y-%m-%d %H:%M')
+                
+                blockchain_text = (
+                    f"📊 **STATUS BLOCKCHAIN**\n\n"
+                    f"✅ **Portfel połączony**\n"
+                    f"🔗 Adres: {wallet[:10]}...{wallet[-8:]}\n"
+                    f"📅 Połączono: {linked_date}\n\n"
+                    f"💎 **DMT w grze:** {dmt_balance:.2f}\n"
+                    f"🏅 **Status:** {'DMT Investor' if dmt_balance > 0 else 'Połączony'}\n"
+                    f"🛒 **Dostęp do sklepu:** {'✅ TAK' if dmt_balance > 0 else '❌ NIE'}\n\n"
+                    f"📊 Ostatnie sprawdzenie: {datetime.now().strftime('%H:%M:%S')}\n"
+                    f"🌐 Sieć: BSC (Binance Smart Chain)\n"
+                    f"🔗 Kontrakt: {DMT_CONTRACT[:10]}...{DMT_CONTRACT[-8:]}"
+                )
+
+            await query.edit_message_text(blockchain_text, reply_markup=reply_markup, parse_mode='Markdown')
+
+        elif query.data == "back_to_main":
+            # Powrót do głównego menu start
+            keyboard = [
+                [InlineKeyboardButton("💎 DMT Shop", callback_data="dmt_shop"), InlineKeyboardButton("🔗 Połącz Portfel", callback_data="link_wallet")],
+                [InlineKeyboardButton("📊 Sprawdź Blockchain", callback_data="check_blockchain")],
+                [InlineKeyboardButton("🌐 Oficjalna Strona + Gry", url="https://donmlekotoken.netlify.app")],
+                [InlineKeyboardButton("🔗 Linktree", url="https://linktr.ee/donmlekotoken")],
+                [InlineKeyboardButton("💎 DexScreener", url="https://dexscreener.com/bsc/0x1fAc48db5079567D8769c9f1c16b228DB435C018")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                f"🐄 **DON MLEKO BOT v4.2**\n\n"
+                f"💎 **Nowe funkcje blockchain:**\n"
+                f"• DMT Shop dla inwestorów\n"
+                f"• Automatyczne wykrywanie transakcji\n"
+                f"• Połączenie z BSC blockchain\n"
+                f"• Specjalne nagrody za prawdziwy DMT\n\n"
+                f"🎮 **Dostępne komendy:**\n"
+                f"🏠 `/start` - Menu główne\n"
+                f"💎 `/dmtshop` - Ekskluzywny sklep\n"
+                f"🔗 `/linkwallet [adres]` - Połącz portfel\n"
+                f"📊 `/checkpurchases` - Sprawdź zakupy\n"
+                f"🎯 `/blockchain` - Status blockchain\n\n"
+                f"🐄 Don Mleko rządzi blockchain!",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+
+        # Handlery zakupów w DMT Shop
+        elif query.data.startswith("buy_dmt_"):
+            item_id = int(query.data.split("_")[-1])
+            user_data = get_user_data_full(user_id)
+            dmt_balance = user_data.get('dmt_purchases', 0)
+            
+            # Definicja przedmiotów
+            shop_items = {
+                1: {"name": "🚀 VIP Boost (24h)", "cost": 50, "type": "vip_boost"},
+                2: {"name": "💎 Diamentowy Status", "cost": 100, "type": "diamond_status"},
+                3: {"name": "👑 Don Status (7 dni)", "cost": 200, "type": "don_status"},
+                4: {"name": "🏗️ Instant Building", "cost": 300, "type": "instant_building"},
+                5: {"name": "⚡ Ultimate Power Pack", "cost": 500, "type": "power_pack"},
+                6: {"name": "🌟 Cosmic Upgrade", "cost": 1000, "type": "cosmic_upgrade"}
+            }
+
+            if item_id not in shop_items:
+                await query.answer("❌ Nieprawidłowy przedmiot!", show_alert=True)
+                return
+
+            item = shop_items[item_id]
+            
+            if dmt_balance < item["cost"]:
+                await query.answer(f"❌ Potrzebujesz {item['cost']} DMT! Masz: {dmt_balance:.2f}", show_alert=True)
+                return
+
+            # Realizuj zakup
+            user_data['dmt_purchases'] = dmt_balance - item["cost"]
+            
+            # Zastosuj efekty przedmiotu
+            now = time.time()
+            
+            if item["type"] == "vip_boost":
+                user_data['vip_boost_until'] = now + 86400  # 24h
+                effect_text = "🚀 VIP Boost aktywny na 24h! x2 wszystkie nagrody!"
+                
+            elif item["type"] == "diamond_status":
+                if "dmt_diamond" not in user_data.get('badges', []):
+                    user_data['badges'] = user_data.get('badges', []) + ["dmt_diamond"]
+                user_data['diamond_status'] = True
+                effect_text = "💎 Diamentowy Status permanentnie aktywny!"
+                
+            elif item["type"] == "don_status":
+                user_data['don_status_until'] = now + 604800  # 7 dni
+                effect_text = "👑 Don Status aktywny na 7 dni!"
+                
+            elif item["type"] == "instant_building":
+                user_data['instant_building_tokens'] = user_data.get('instant_building_tokens', 0) + 1
+                effect_text = "🏗️ Otrzymałeś token na darmowy budynek!"
+                
+            elif item["type"] == "power_pack":
+                user_data['power_pack_until'] = now + 604800  # 7 dni
+                # Reset wszystkich cooldownów
+                for location in MINING_LOCATIONS.keys():
+                    user_data[f'last_mine_{location}'] = 0
+                user_data['last_mine'] = 0
+                user_data['last_heist'] = 0
+                user_data['last_mission'] = 0
+                user_data['last_lottery'] = 0
+                effect_text = "⚡ Ultimate Power Pack aktywny na 7 dni! Wszystkie cooldowny zresetowane!"
+                
+            elif item["type"] == "cosmic_upgrade":
+                user_data['mining_level'] = user_data.get('mining_level', 1) + 100
+                user_data['mafia_respect'] = user_data.get('mafia_respect', 0) + 10000
+                user_data['god_mode_until'] = now + 86400  # 24h god mode
+                effect_text = "🌟 Cosmic Upgrade zastosowany! +100 mining levels, +10k respect, God Mode 24h!"
+
+            update_user_data(user_id, user_data)
+
+            # Pokaż wynik zakupu
+            keyboard = [
+                [InlineKeyboardButton("💎 Powrót do sklepu", callback_data="dmt_shop")],
+                [InlineKeyboardButton("📊 Sprawdź Status", callback_data="check_blockchain")],
+                [InlineKeyboardButton("🔙 Menu główne", callback_data="back_to_main")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                f"✅ **ZAKUP UDANY!**\n\n"
+                f"🛒 Kupiono: {item['name']}\n"
+                f"💸 Koszt: {item['cost']} DMT\n"
+                f"💎 Pozostało DMT: {user_data['dmt_purchases']:.2f}\n\n"
+                f"🎁 **EFEKT:**\n"
+                f"{effect_text}\n\n"
+                f"🎉 Dziękujemy za inwestycję w prawdziwy DMT!",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+
+        # Handler dla misji gildijnych
+        elif query.data.startswith("guild_mission_"):
+            try:
+                mission_id = int(query.data.split("_")[-1])
+            except ValueError:
+                await query.answer("❌ Błąd w ID misji!", show_alert=True)
+                return
+
+            # Sprawdź czy użytkownik należy do gildii
+            guild_id, guild = get_user_guild(user_id)
+            if not guild:
+                await query.answer("❌ Nie należysz do żadnej gildii!", show_alert=True)
+                return
+
+            # Sprawdź czy to lider gildii
+            if str(user_id) != guild['leader_id']:
+                await query.answer("❌ Tylko lider gildii może rozpoczynać misje!", show_alert=True)
+                return
+
+            member_count = len(guild.get('members', []))
+            available_missions = [m for m in GUILD_MISSIONS if member_count >= m['min_members']]
+
+            if mission_id < 1 or mission_id > len(available_missions):
+                await query.answer("❌ Nieprawidłowa misja!", show_alert=True)
+                return
+
+            mission = available_missions[mission_id - 1]
+
+            # Sprawdź cooldown
+            last_mission = guild.get('last_mission', 0)
+            now = time.time()
+
+            if now - last_mission < 3600:  # 1 godzina
+                remaining = int(3600 - (now - last_mission))
+                await query.answer(f"⏰ Następna misja za {remaining//60}m {remaining%60}s!", show_alert=True)
+                return
+
+            # Rozpocznij misję gildijną
+            success_chance = min(90, 50 + get_guild_level(member_count) * 10)
+
+            if random.randint(1, 100) <= success_chance:
+                # Sukces!
+                guilds_data = load_guilds_data()
+                guild = guilds_data[guild_id]
+
+                # Nagrody dla wszystkich członków
+                rewards_given = 0
+                for member_id in guild['members']:
+                    reward = random.randint(*mission['reward_per_member'])
+                    add_points(int(member_id), reward)
+                    rewards_given += reward
+
+                # Aktualizuj gildię
+                guild['last_mission'] = now
+                guild['experience'] += mission['guild_experience']
+                guild['missions_completed'] = guild.get('missions_completed', 0) + 1
+                guilds_data[guild_id] = guild
+                save_guilds_data(guilds_data)
+
+                # Powiadom wszystkich członków
+                for member_id in guild['members']:
+                    try:
+                        await query.bot.send_message(
+                            chat_id=int(member_id),
+                            text=f"🎉 **MISJA GILDII UDANA!**\n\n"
+                                 f"🎯 {mission['name']}\n"
+                                 f"💰 Twoja nagroda: {random.randint(*mission['reward_per_member'])} DMT\n"
+                                 f"⭐ Doświadczenie gildii: +{mission['guild_experience']}\n\n"
+                                 f"🏛️ Gildia: {guild['name']}"
+                        )
+                    except:
+                        pass
+
+                keyboard = [
+                    [InlineKeyboardButton("🎯 Kolejna Misja", callback_data="guild_missions")],
+                    [InlineKeyboardButton("🏛️ Menu Gildii", callback_data="back_to_guild")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+
+                await query.edit_message_text(
+                    f"🎉 **MISJA GILDII UDANA!**\n\n"
+                    f"🎯 {mission['name']}\n"
+                    f"💰 Łączne nagrody: {rewards_given} DMT\n"
+                    f"⭐ Doświadczenie: +{mission['guild_experience']}\n"
+                    f"👥 Członkowie nagrodzeni: {len(guild['members'])}\n\n"
+                    f"🏛️ {guild['name']} staje się silniejsza!",
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+            else:
+                # Porażka
+                guilds_data = load_guilds_data()
+                guild = guilds_data[guild_id]
+                guild['last_mission'] = now
+                guilds_data[guild_id] = guild
+                save_guilds_data(guilds_data)
+
+                keyboard = [
+                    [InlineKeyboardButton("🎯 Spróbuj Ponownie", callback_data="guild_missions")],
+                    [InlineKeyboardButton("🏛️ Menu Gildii", callback_data="back_to_guild")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+
+                await query.edit_message_text(
+                    f"💀 **MISJA NIEUDANA!**\n\n"
+                    f"🎯 {mission['name']}\n"
+                    f"😵 Gildia poniosła porażkę!\n"
+                    f"⚠️ Szanse były: {success_chance}%\n\n"
+                    f"⏰ Spróbujcie ponownie za godzinę!",
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+
+        elif query.data == "guild_missions":
+            # Powrót do listy misji gildijnych
+            guild_id, guild = get_user_guild(user_id)
+            if not guild:
+                await query.answer("❌ Nie należysz do żadnej gildii!", show_alert=True)
+                return
+
+            member_count = len(guild.get('members', []))
+            available_missions = [m for m in GUILD_MISSIONS if member_count >= m['min_members']]
+
+            if not available_missions:
+                await query.edit_message_text(
+                    f"❌ **BRAK DOSTĘPNYCH MISJI!**\n\n"
+                    f"👥 Członkowie: {member_count}/30\n"
+                    f"🎯 Najmniejsza misja wymaga 2 członków\n\n"
+                    f"💡 Zwerbujcie więcej członków!",
+                    parse_mode='Markdown'
+                )
+                return
+
+            missions_text = "🎯 **DOSTĘPNE MISJE GILDII:**\n\n"
+            missions_text += f"👥 Członkowie: {member_count}/30\n"
+            missions_text += f"✅ Dostępne: {len(available_missions)} misji\n\n"
+
+            # Sprawdź cooldown
+            last_mission = guild.get('last_mission', 0)
+            now = time.time()
+            cooldown_active = now - last_mission < 3600
+
+            if cooldown_active:
+                remaining = int(3600 - (now - last_mission))
+                missions_text += f"⏰ Następna misja za {remaining//60}m {remaining%60}s!\n\n"
+
+            keyboard = []
+
+            for i, mission in enumerate(available_missions, 1):
+                missions_text += (
+                    f"{i}. **{mission['name']}** ({mission['difficulty']})\n"
+                    f"   📝 {mission['description']}\n"
+                    f"   👥 Wymagane: {mission['min_members']} członków\n"
+                    f"   💰 Nagroda: {mission['reward_per_member'][0]}-{mission['reward_per_member'][1]} DMT/osoba\n"
+                    f"   ⭐ Doświadczenie: +{mission['guild_experience']}\n\n"
+                )
+
+                # Dodaj przycisk tylko jeśli nie ma cooldown i użytkownik to lider
+                if not cooldown_active and str(user_id) == guild['leader_id']:
+                    button_text = f"🎯 {mission['name']}"
+                    if len(button_text) > 30:
+                        button_text = button_text[:27] + "..."
+
+                    keyboard.append([InlineKeyboardButton(
+                        button_text,
+                        callback_data=f"guild_mission_{i}"
+                    )])
+
+            keyboard.append([InlineKeyboardButton("🏛️ Powrót do Gildii", callback_data="back_to_guild")])
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                missions_text,
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+
+        elif query.data == "back_to_guild":
+            # Powrót do menu gildii
+            guild_id, guild = get_user_guild(user_id)
+            if not guild:
+                await query.answer("❌ Nie należysz do żadnej gildii!", show_alert=True)
+                return
+
+            member_count = len(guild.get('members', []))
+            guild_level = get_guild_level(member_count)
+            guild_exp = guild.get('experience', 0)
+
+            guild_text = (
+                f"🏛️ **TWOJA GILDIA: {guild['name']}**\n\n"
+                f"👑 Lider: {guild['leader_name']}\n"
+                f"👥 Członkowie: {member_count}/30\n"
+                f"📊 Poziom: {guild_level} - {GUILD_LEVELS[guild_level]['name']}\n"
+                f"⭐ Doświadczenie: {guild_exp}\n"
+                f"💰 Bonus gildii: +{GUILD_LEVELS[guild_level]['bonus']}%\n\n"
+                f"🎯 Wybierz akcję:"
+            )
+
+            keyboard = [
+                [InlineKeyboardButton("👥 Członkowie", callback_data="guild_members")],
+                [InlineKeyboardButton("🎯 Misje", callback_data="guild_missions")],
+                [InlineKeyboardButton("📊 Statystyki", callback_data="guild_stats")],
+                [InlineKeyboardButton("💰 Skarbiec", callback_data="guild_treasury")],
+                [InlineKeyboardButton("🚪 Opuść Gildię", callback_data="guild_leave")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                guild_text,
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+
+        elif query.data == "guild_members":
+            # Lista członków gildii
+            guild_id, guild = get_user_guild(user_id)
+            if not guild:
+                await query.answer("❌ Nie należysz do żadnej gildii!", show_alert=True)
+                return
+
+            members_text = f"👥 **CZŁONKOWIE GILDII: {guild['name']}**\n\n"
+            member_count = len(guild.get('members', []))
+
+            # Pobierz dane wszystkich członków
+            data = load_user_data()
+            members_info = []
+
+            for member_id in guild.get('members', []):
+                if member_id in data:
+                    member_data = data[member_id]
+                    try:
+                        chat_member = await query.bot.get_chat(member_id)
+                        username = chat_member.first_name or f"Gracz{member_id[-4:]}"
+                    except:
+                        username = f"Gracz{member_id[-4:]}"
+
+                    members_info.append({
+                        'id': member_id,
+                        'name': username,
+                        'points': member_data.get('points', 0),
+                        'respect': member_data.get('mafia_respect', 0),
+                        'is_leader': member_id == guild['leader_id']
+                    })
+
+            # Sortuj według punktów
+            members_info.sort(key=lambda x: x['points'], reverse=True)
+
+            for i, member in enumerate(members_info, 1):
+                leader_icon = "👑 " if member['is_leader'] else ""
+                rank = get_mafia_rank(member['respect'])
+
+                members_text += (
+                    f"{i}. {leader_icon}**{member['name']}**\n"
+                    f"   💎 {member['points']:,} DMT | ⭐ {member['respect']} | 🤵 {rank}\n\n"
+                )
+
+            guild_level = get_guild_level(member_count)
+            members_text += (
+                f"📊 **PODSUMOWANIE:**\n"
+                f"👥 Łącznie członków: {member_count}/30\n"
+                f"📊 Poziom gildii: {guild_level}\n"
+                f"💰 Bonus: +{GUILD_LEVELS[guild_level]['bonus']}%"
+            )
+
+            keyboard = [[InlineKeyboardButton("🔙 Powrót do Gildii", callback_data="back_to_guild")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(members_text, reply_markup=reply_markup, parse_mode='Markdown')
+
+        elif query.data == "guild_stats":
+            # Statystyki gildii
+            guild_id, guild = get_user_guild(user_id)
+            if not guild:
+                await query.answer("❌ Nie należysz do żadnej gildii!", show_alert=True)
+                return
+
+            member_count = len(guild.get('members', []))
+            guild_level = get_guild_level(member_count)
+            experience = guild.get('experience', 0)
+            missions_completed = guild.get('missions_completed', 0)
+            treasury = guild.get('treasury', 0)
+
+            # Oblicz łączne statystyki członków
+            data = load_user_data()
+            total_points = 0
+            total_respect = 0
+            total_battles = 0
+
+            for member_id in guild['members']:
+                if member_id in data:
+                    member_data = data[member_id]
+                    total_points += member_data.get('points', 0)
+                    total_respect += member_data.get('mafia_respect', 0)
+                    total_battles += member_data.get('battle_wins', 0)
+
+            stats_text = (
+                f"📊 **STATYSTYKI GILDII: {guild['name']}**\n\n"
+                f"👑 Lider: {guild['leader_name']}\n"
+                f"👥 Członkowie: {member_count}/30\n"
+                f"📊 Poziom gildii: {guild_level} - {GUILD_LEVELS[guild_level]['name']}\n"
+                f"⭐ Doświadczenie: {experience}\n"
+                f"🎯 Ukończone misje: {missions_completed}\n"
+                f"💰 Skarbiec gildii: {treasury} DMT\n\n"
+                f"🔥 **SIŁA GILDII:**\n"
+                f"💎 Łączne punkty: {total_points:,}\n"
+                f"⭐ Łączny szacunek: {total_respect:,}\n"
+                f"⚔️ Łączne bitwy: {total_battles}\n\n"
+                f"🏆 Bonus dla członków: +{GUILD_LEVELS[guild_level]['bonus']}%"
+            )
+
+            keyboard = [[InlineKeyboardButton("🔙 Powrót do Gildii", callback_data="back_to_guild")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(stats_text, reply_markup=reply_markup, parse_mode='Markdown')
+
+        elif query.data == "guild_treasury":
+            # Skarbiec gildii
+            guild_id, guild = get_user_guild(user_id)
+            if not guild:
+                await query.answer("❌ Nie należysz do żadnej gildii!", show_alert=True)
+                return
+
+            treasury = guild.get('treasury', 0)
+            user_points = user_data.get('points', 0)
+
+            treasury_text = (
+                f"💰 **SKARBIEC GILDII: {guild['name']}**\n\n"
+                f"🏦 Stan skarbca: {treasury} DMT\n"
+                f"💎 Twoje punkty: {user_points} DMT\n\n"
+                f"**DAROWIZNY:**\n"
+                f"💡 Możesz wpłacić swoje DMT do skarbca gildii\n"
+                f"🤝 Pomaga to w rozwoju całej gildii\n"
+                f"📈 Środki mogą być używane na specjalne misje\n\n"
+                f"💸 Użyj: `/guild donate [kwota]` aby wpłacić"
+            )
+
+            # Dodaj przyciski szybkich wpłat
+            keyboard = []
+            if user_points >= 100:
+                keyboard.append([InlineKeyboardButton("💰 Wpłać 100 DMT", callback_data="guild_donate_100")])
+            if user_points >= 500:
+                keyboard.append([InlineKeyboardButton("💎 Wpłać 500 DMT", callback_data="guild_donate_500")])
+            if user_points >= 1000:
+                keyboard.append([InlineKeyboardButton("🏆 Wpłać 1000 DMT", callback_data="guild_donate_1000")])
+            
+            keyboard.append([InlineKeyboardButton("🔙 Powrót do Gildii", callback_data="back_to_guild")])
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(treasury_text, reply_markup=reply_markup, parse_mode='Markdown')
+
+        elif query.data.startswith("guild_donate_"):
+            # Szybka wpłata do skarbca
+            amount = int(query.data.split("_")[-1])
+            guild_id, guild = get_user_guild(user_id)
+            
+            if not guild:
+                await query.answer("❌ Nie należysz do żadnej gildii!", show_alert=True)
+                return
+
+            user_points = user_data.get('points', 0)
+            if user_points < amount:
+                await query.answer(f"❌ Nie masz wystarczająco DMT! Masz: {user_points}, potrzebujesz: {amount}", show_alert=True)
+                return
+
+            # Wykonaj darowiznę
+            add_points(user_id, -amount)
+
+            # Aktualizuj skarbiec gildii
+            guilds_data = load_guilds_data()
+            guild = guilds_data[guild_id]
+            guild['treasury'] = guild.get('treasury', 0) + amount
+            guilds_data[guild_id] = guild
+            save_guilds_data(guilds_data)
+
+            # Aktualizuj statystyki użytkownika
+            fresh_user_data = get_user_data_full(user_id)
+            fresh_user_data['guild_donations'] = fresh_user_data.get('guild_donations', 0) + amount
+            update_user_data(user_id, fresh_user_data)
+
+            new_points = get_user_points(user_id)
+
+            keyboard = [
+                [InlineKeyboardButton("💰 Skarbiec", callback_data="guild_treasury")],
+                [InlineKeyboardButton("🔙 Powrót do Gildii", callback_data="back_to_guild")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                f"💰 **DAROWIZNA DLA GILDII!**\n\n"
+                f"🏛️ Gildia: **{guild['name']}**\n"
+                f"💸 Wpłaciłeś: {amount} DMT\n"
+                f"🏦 Skarbiec gildii: {guild['treasury']} DMT\n"
+                f"💎 Pozostało Ci: {new_points} DMT\n\n"
+                f"🙏 Dziękuje w imieniu całej gildii!",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+
+        elif query.data == "guild_leave":
+            # Opuszczenie gildii
+            guild_id, guild = get_user_guild(user_id)
+            if not guild:
+                await query.answer("❌ Nie należysz do żadnej gildii!", show_alert=True)
+                return
+
+            # Sprawdź czy to lider
+            if str(user_id) == guild['leader_id']:
+                if len(guild['members']) > 1:
+                    keyboard = [[InlineKeyboardButton("🔙 Powrót do Gildii", callback_data="back_to_guild")]]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    
+                    await query.edit_message_text(
+                        "❌ **NIE MOŻESZ OPUŚCIĆ GILDII!**\n\n"
+                        "👑 Jesteś liderem gildii z innymi członkami\n\n"
+                        "**OPCJE:**\n"
+                        "1. Przekaż przywództwo innemu członkowi\n"
+                        "2. Rozwiąż gildię (jeśli będziesz jedynym członkiem)\n\n"
+                        "💡 Użyj komend tekstowych w czacie aby zarządzać gildią",
+                        reply_markup=reply_markup,
+                        parse_mode='Markdown'
+                    )
+                    return
+                else:
+                    # Usuń gildię jeśli lider był jedynym członkiem
+                    guilds_data = load_guilds_data()
+                    del guilds_data[guild_id]
+                    save_guilds_data(guilds_data)
+                    
+                    keyboard = [[InlineKeyboardButton("🏛️ Utwórz Nową Gildię", callback_data="guild_create_new")]]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    
+                    await query.edit_message_text(
+                        f"🏛️ **GILDIA ROZWIĄZANA!**\n\n"
+                        f"👑 Gildia **{guild['name']}** została rozwiązana\n"
+                        f"📊 Byłeś jedynym członkiem\n\n"
+                        f"💡 Możesz utworzyć nową gildię lub dołączyć do istniejącej",
+                        reply_markup=reply_markup,
+                        parse_mode='Markdown'
+                    )
+                    return
+
+            # Usuń członka z gildii
+            guilds_data = load_guilds_data()
+            guild['members'].remove(str(user_id))
+            guilds_data[guild_id] = guild
+            save_guilds_data(guilds_data)
+
+            keyboard = [
+                [InlineKeyboardButton("🏛️ Lista Gildii", callback_data="guild_list_available")],
+                [InlineKeyboardButton("🏛️ Utwórz Nową", callback_data="guild_create_new")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                f"🚪 **OPUŚCIŁEŚ GILDIĘ!**\n\n"
+                f"👋 Opuściłeś gildię **{guild['name']}**\n"
+                f"📊 Gildia ma teraz {len(guild['members'])} członków\n\n"
+                f"💡 Możesz dołączyć do innej gildii lub utworzyć własną",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+
+        # Nowe handlery dla gier
+        elif query.data == "game_blackjack":
+            await query.edit_message_text(
+                "🃏 **BLACKJACK DON MLEKO**\n\n"
+                "Cel: Uzyskaj 21 lub blisko 21, ale nie przekrocz!\n"
+                "Użycie: `/blackjack [stawka]`\n\n"
+                "🎯 Minimalna stawka: 10 DMT\n"
+                "🎯 Maksymalna stawka: 200 DMT\n\n"
+                "💡 Wpisz komendę w chacie aby zagrać!",
+                parse_mode='Markdown'
+            )
+
+        elif query.data == "game_dice":
+            await query.edit_message_text(
+                "🎲 **GRA W KOŚCI DON MLEKO**\n\n"
+                "Zgadnij sumę dwóch kości!\n"
+                "Użycie: `/dice [stawka] [suma]`\n\n"
+                "🎯 Suma: 2-12\n"
+                "🎯 Stawka: 5-100 DMT\n\n"
+                "💰 **Wypłaty:**\n"
+                "•• 7 (najczęstsza): x4\n"
+                "• 6,8: x5 | 5,9: x6\n"
+                "• 4,10: x8 | 3,11: x10\n"
+                "• 2,12 (najrzadsza): x15\n\n"
+                "💡 Wpisz komendę w chacie aby zagrać!",
+                parse_mode='Markdown'
+            )
+
+        elif query.data == "game_crash":
+            await query.edit_message_text(
+                "🚀 **CRASH GAME DON MLEKO**\n\n"
+                "Rakieta leci w górę! Kiedy się zatrzyma?\n"
+                "Użycie: `/crash [stawka] [multiplier]`\n\n"
+                "🎯 Stawka: 10-200 DMT\n"
+                "🎯 Multiplier: 1.1x - 10.0x\n\n"
+                "📈 Im wyższy multiplier, tym większe ryzyko!\n"
+                "🌙 Jeśli rakieta doleci do Twojego multiplikatora,\n"
+                "    wygrywasz stawkę x multiplier!\n\n"
+                "💡 Wpisz komendę w chacie aby zagrać!",
+                parse_mode='Markdown'
+            )
+
+        elif query.data == "game_wheel":
+            await query.edit_message_text(
+                "🎡 **KOŁO FORTUNY DON MLEKO**\n\n"
+                "Zakręć kołem i zobacz co wypadnie!\n"
+                "Użycie: `/wheel [stawka]`\n\n"
+                "🎯 Stawka: 20-150 DMT\n\n"
+                "🎁 **NAGRODY:**\n"
+                "💎 JACKPOT (1%) - x20\n"
+                "🚀 DMT TO MOON (5%) - x10\n"
+                "💰 Duża wygrana (10%) - x5\n"
+                "🥛 Don Mleko (15%) - x3\n"
+                "🐄 Krowa (25%) - x2\n"
+                "😢 Nic (44%) - x0\n\n"
+                "🐄 **Don Mleko zawsze nagradza!**\n\n"
+                "💡 Wpisz komendę w chacie aby zagrać!",
+                parse_mode='Markdown'
+            )
+
+
+    except Exception as e:
+        logging.error(f"Błąd w button_callback: {e}")
+
+# === FUNKCJE MIASTA ===
+
+async def city_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.effective_user.id
+        user_data = get_user_data_full(user_id)
+
+        territory_owned = user_data.get('territory_owned', 0)
+        special_buildings = user_data.get('special_buildings', [])
+
+        city_text = "🏙️ **TWOJE MIASTO DON MLEKO:**\n\n"
+
+        # Pokaż posiadane terytoria
+        city_text += "🏘️ **DZIELNICE:**\n"
+        total_income = 0
+        for i in range(territory_owned):
+            territory = TERRITORIES[i]
+            total_income += territory['income']
+            city_text += f"✅ {territory['name']} (+{territory['income']} DMT/h)\n"
+
+        if territory_owned < len(TERRITORIES):
+            next_territory = TERRITORIES[territory_owned]
+            city_text += f"🔒 Następna: {next_territory['name']} ({next_territory['cost']} DMT)\n"
+
+        # Pokaż specjalne budynki
+        city_text += f"\n🏗️ **SPECJALNE BUDYNKI:** ({len(special_buildings)}/5)\n"
+        if special_buildings:
+            for building_id in special_buildings:
+                if building_id in SPECIAL_BUILDINGS:
+                    building = SPECIAL_BUILDINGS[building_id]
+                    city_text += f"✅ {building['name']}\n"
+        else:
+            city_text += "Brak specjalnych budynków\n"
+
+        city_text += f"\n💰 **Łączny dochód:** {total_income} DMT/godzina\n"
+        city_text += f"👥 **Populacja:** {territory_owned * 1000 + len(special_buildings) * 500}\n"
+        city_text += f"📊 **Poziom miasta:** {get_city_level(territory_owned, len(special_buildings))}\n\n"
+
+        city_text += "**KOMENDY:**\n"
+        city_text += "🏘️ `/territory` - Kup dzielnice\n"
+        city_text += "🏗️ `/buildings` - Specjalne budynki\n"
+        city_text += "⛏️ `/mining` - Rozszerzone kopanie\n"
+        city_text += "🛡️ `/protection` - Zbierz dochody"
+
+        await update.message.reply_text(city_text, parse_mode='Markdown')
+
+    except Exception as e:
+        logging.error(f"Błąd w city_overview: {e}")
+        await update.message.reply_text("❌ Błąd w przeglądzie miasta!")
+
+def get_city_level(territories, special_buildings):
+    total_score = territories * 2 + special_buildings * 3
+    if total_score >= 30:
+        return "🌆 Metropolia"
+    elif total_score >= 20:
+        return "🏙️ Wielkie Miasto"
+    elif total_score >= 12:
+        return "🏘️ Miasto"
+    elif total_score >= 6:
+        return "🏠 Miasteczko"
+    else:
+        return "🏚️ Wioska"
+
+async def super_lottery(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Super loteria z mega nagrodami"""
+    try:
+        user_id = update.effective_user.id
+        user_data = get_user_data_full(user_id)
+
+        # Sprawdź cooldown (24 godziny)
+        last_lottery = user_data.get('last_lottery', 0)
+        now = time.time()
+
+        if now - last_lottery < 86400:  # 24 godziny
+            remaining = int(86400 - (now - last_lottery))
+            hours = remaining // 3600
+            minutes = (remaining % 3600) // 60
+            await update.message.reply_text(f"🎫 Następna loteria za {hours}h {minutes}m!")
+            return
+
+        # Koszt uczestnictwa
+        cost = 1000
+        if user_data.get('points', 0) < cost:
+            await update.message.reply_text(f"❌ Potrzebujesz {cost} DMT aby grać w super loterię!")
+            return
+
+        add_points(user_id, -cost)
+
+        # Super nagrody
+        lottery_prizes = [
+            {"name": "💥 MEGA JACKPOT", "value": 100000, "chance": 1},
+            {"name": "🚀 KOSMICZNY BONUS", "value": 50000, "chance": 3},
+            {"name": "💎 DIAMENTOWA NAGRODA", "value": 25000, "chance": 5},
+            {"name": "🏆 ZŁOTY BONUS", "value": 10000, "chance": 10},
+            {"name": "🥈 SREBRNY BONUS", "value": 5000, "chance": 20},
+            {"name": "🥉 BRĄZOWY BONUS", "value": 2000, "chance": 30},
+            {"name": "😢 Niestety nic", "value": 0, "chance": 31}
+        ]
+
+        rand = random.randint(1, 100)
+        cumulative = 0
+
+        for prize in lottery_prizes:
+            cumulative += prize["chance"]
+            if rand <= cumulative:
+                result = prize
+                break
+
+        if result["value"] > 0:
+            # Sprawdź bonusy z budynków
+            special_buildings = user_data.get('special_buildings', [])
+            multiplier = 1.0
+
+            if 'casino_royale' in special_buildings:
+                multiplier += 1.0  # x2 z casino
+            if 'rakieta_don_mleko' in special_buildings:
+                multiplier += 1.0  # kolejne x2
+
+            final_reward = int(result["value"] * multiplier)
+            points = add_points(user_id, final_reward)
+
+            # Auto-post dla dużych wygranych
+            if final_reward >= 25000:
+                username = update.effective_user.first_name or f"Gracz{str(user_id)[-4:]}"
+                auto_create_achievement_post(user_id, username, 'jackpot', f"{final_reward:,}")
+
+            await update.message.reply_text(
+                f"🎫 **SUPER LOTERIA WYNIK!**\n\n"
+                f"🎉 {result['name']}\n"
+                f"💰 Nagroda bazowa: {result['value']:,} DMT\n"
+                f"🔥 Mnożnik budynków: x{multiplier}\n"
+                f"💎 ŁĄCZNA WYGRANA: {final_reward:,} DMT!\n"
+                f"🏆 Masz teraz: {points:,} punktów\n\n"
+                f"🎲 Szansa była: {result['chance']}%"
+            )
+        else:
+            await update.message.reply_text(
+                f"🎫 **SUPER LOTERIA**\n\n"
+                f"😢 {result['name']}\n"
+                f"💸 Straciłeś: {cost} DMT\n"
+                f"🍀 Więcej szczęścia jutro!\n\n"
+                f"💡 Zbuduj Casino Royale dla bonusów!"
+            )
+
+        user_data['last_lottery'] = now
+        update_user_data(user_id, user_data)
+
+    except Exception as e:
+        logging.error(f"Błąd w super_lottery: {e}")
+        await update.message.reply_text("❌ Błąd w super loterii!")
+
+async def time_travel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Podróże w czasie - skip cooldown'y"""
+    try:
+        user_id = update.effective_user.id
+        user_data = get_user_data_full(user_id)
+
+        # Sprawdź czy ma Portal Czasowy
+        special_buildings = user_data.get('special_buildings', [])
+        if 'portal_czasowy' not in special_buildings:
+            await update.message.reply_text("❌ Potrzebujesz Portal Czasowy aby podróżować w czasie!")
+            return
+
+        if not context.args:
+            await update.message.reply_text(
+                "🌀 **PORTAL CZASOWY**\n\n"
+                "Pomiń cooldown'y za DMT!\n\n"
+                "📝 Użycie: `/timetravel [akcja]`\n\n"
+                "**DOSTĘPNE AKCJE:**\n"
+                "• mining - Pomiń cooldown kopania (500 DMT)\n"
+                "• heist - Pomiń cooldown napadu (1000 DMT)\n"
+                "• mission - Pomiń cooldown misji (750 DMT)\n"
+                "• lottery - Pomiń cooldown loterii (2000 DMT)\n"
+                "• all - Pomiń wszystkie cooldown'y (3000 DMT)"
+            )
+            return
+
+        action = context.args[0].lower()
+        costs = {
+            'mining': 500,
+            'heist': 1000,
+            'mission': 750,
+            'lottery': 2000,
+            'all': 3000
+        }
+
+        if action not in costs:
+            await update.message.reply_text("❌ Nieznana akcja! Użyj: mining, heist, mission, lottery, all")
+            return
+
+        cost = costs[action]
+        if user_data.get('points', 0) < cost:
+            await update.message.reply_text(f"❌ Potrzebujesz {cost} DMT na podróż w czasie!")
+            return
+
+        add_points(user_id, -cost)
+        now = time.time()
+
+        # Resetuj cooldown'y
+        if action == 'mining' or action == 'all':
+            for location in MINING_LOCATIONS.keys():
+                user_data[f'last_mine_{location}'] = 0
+            user_data['last_mine'] = 0
+
+        if action == 'heist' or action == 'all':
+            user_data['last_heist'] = 0
+
+        if action == 'mission' or action == 'all':
+            user_data['last_mission'] = 0
+
+        if action == 'lottery' or action == 'all':
+            user_data['last_lottery'] = 0
+
+        user_data['last_timetravel'] = now
+        update_user_data(user_id, user_data)
+
+        await update.message.reply_text(
+            f"🌀 **PODRÓŻ W CZASIE UDANA!**\n\n"
+            f"⚡ Resetowano cooldown: {action}\n"
+            f"💸 Koszt: {cost} DMT\n"
+            f"💎 Pozostało: {get_user_points(user_id)} DMT\n\n"
+            f"🎯 Wszystkie akcje znów dostępne!"
+        )
+
+    except Exception as e:
+        logging.error(f"Błąd w time_travel: {e}")
+        await update.message.reply_text("❌ Błąd w portalu czasowym!")
+
+async def special_buildings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.effective_user.id
+        user_data = get_user_data_full(user_id)
+
+        if not context.args:
+            buildings_text = "🏗️ **SPECJALNE BUDYNKI:**\n\n"
+            owned_buildings = user_data.get('special_buildings', [])
+
+            for building_id, building in SPECIAL_BUILDINGS.items():
+                status = "✅ POSIADANE" if building_id in owned_buildings else f"💰 {building['cost']} DMT"
+                buildings_text += (
+                    f"**{building['name']}**\n"
+                    f"📝 {building['description']}\n"
+                    f"💰 Koszt: {building['cost']} DMT\n"
+                    f"📊 Status: {status}\n\n"
+                )
+
+            buildings_text += f"🏗️ Posiadasz: {len(owned_buildings)}/5 budynków\n"
+            buildings_text += "Użyj: `/buildings [nazwa]` aby kupić\n"
+            buildings_text += "Dostępne: mleczarnia, laboratorium, akademia, skarbiec, fabryka_botow"
+
+            await update.message.reply_text(buildings_text, parse_mode='Markdown')
+            return
+
+        building_id = context.args[0].lower()
+
+        if building_id not in SPECIAL_BUILDINGS:
+            await update.message.reply_text("❌ Nieznany budynek! Dostępne: mleczarnia, laboratorium, akademia, skarbiec, fabryka_botow")
+            return
+
+        owned_buildings = user_data.get('special_buildings', [])
+
+        if building_id in owned_buildings:
+            await update.message.reply_text("❌ Ten budynek już posiadasz!")
+            return
+
+        building = SPECIAL_BUILDINGS[building_id]
+        points = user_data.get('points', 0)
+
+        if points < building['cost']:
+            await update.message.reply_text(f"❌ Potrzebujesz {building['cost']} DMT aby kupić {building['name']}!")
+            return
+
+        # Kup budynek
+        add_points(user_id, -building['cost'])
+        owned_buildings.append(building_id)
+        user_data['special_buildings'] = owned_buildings
+        update_user_data(user_id, user_data)
+
+        new_points = get_user_points(user_id)
+
+        await update.message.reply_text(
+            f"🏗️ **BUDYNEK WYBUDOWANY!**\n\n"
+            f"🏛️ {building['name']}\n"
+            f"💸 Koszt: {building['cost']} DMT\n"
+            f"🎯 Bonus: {building['description']}\n"
+            f"💎 Pozostało punktów: {new_points}\n\n"
+            f"🏗️ Posiadasz {len(owned_buildings)}/5 specjalnych budynków!"
+        )
+
+    except Exception as e:
+        logging.error(f"Błąd w special_buildings: {e}")
+        await update.message.reply_text("❌ Błąd w systemie budynków!")
+
+async def advanced_mining(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.effective_user.id
+        user_data = get_user_data_full(user_id)
+
+        if not context.args:
+            mining_text = "⛏️ **ROZSZERZONE KOPANIE:**\n\n"
+            mining_level = user_data.get('mining_level', 1)
+
+            mining_text += f"📊 **Twój poziom mining:** {mining_level}\n\n"
+
+            for location_id, location in MINING_LOCATIONS.items():
+                if mining_level >= location['unlock_level']:
+                    status = "✅ DOSTĘPNE"
+                else:
+                    status = f"🔒 Wymagany poziom {location['unlock_level']}"
+
+                mining_text += (
+                    f"**{location['name']}**\n"
+                    f"📝 {location['description']}\n"
+                    f"🎯 Szanse: {location['success_rate']}%\n"
+                    f"💎 Nagroda: {location['base_reward'][0]}-{location['base_reward'][1]} DMT\n"
+                    f"⏰ Cooldown: {location['cooldown']//60} min\n"
+                    f"🌟 Rzadkie: {location['rare_chance']}%\n"
+                    f"📊 Status: {status}\n\n"
+                )
+
+            mining_text += "Użyj: `/mining [lokacja]` aby kopać\n"
+            mining_text += "Dostępne: podstawowa, gleboka, diamentowa, magiczna, kosmiczna"
+
+            await update.message.reply_text(mining_text, parse_mode='Markdown')
+            return
+
+        location_id = context.args[0].lower()
+
+        # Mapowanie nazw
+        location_mapping = {
+            'podstawowa': 'kopalnia_podstawowa',
+            'gleboka': 'kopalnia_glleboka',
+            'diamentowa': 'kopalnia_diamentowa',
+            'magiczna': 'kopalnia_magiczna',
+            'kosmiczna': 'kopalnia_kosmiczna'
+        }
+
+        if location_id in location_mapping:
+            location_id = location_mapping[location_id]
+
+        if location_id not in MINING_LOCATIONS:
+            await update.message.reply_text("❌ Nieznana lokacja! Użyj: podstawowa, gleboka, diamentowa, magiczna, kosmiczna")
+            return
+
+        location = MINING_LOCATIONS[location_id]
+        mining_level = user_data.get('mining_level', 1)
+
+        if mining_level < location['unlock_level']:
+            await update.message.reply_text(f"❌ Wymagany poziom mining: {location['unlock_level']}! Masz: {mining_level}")
+            return
+
+        # Sprawdź cooldown dla tej lokacji
+        last_mine_key = f'last_mine_{location_id}'
+        last_mine = user_data.get(last_mine_key, 0)
+        now = time.time()
+
+        if now - last_mine < location['cooldown']:
+            remaining = int(location['cooldown'] - (now - last_mine))
+            minutes = remaining // 60
+            seconds = remaining % 60
+            await update.message.reply_text(f"⏰ {location['name']} - Musisz poczekać {minutes}m {seconds}s!")
+            return
+
+        # Oblicz bonusy z budynków
+        special_buildings = user_data.get('special_buildings', [])
+        mining_boost = 0
+        rare_boost = 0
+        all_rewards_boost = 0
+        time_reduction = 0
+
+        if 'mleczarnia' in special_buildings:
+            mining_boost += 25
+        if 'laboratorium' in special_buildings:
+            rare_boost += 50
+        if 'cyber_centrum' in special_buildings:
+            all_rewards_boost += 40
+        if 'rakieta_don_mleko' in special_buildings:
+            mining_boost += 200  # MEGA BOOST
+            rare_boost += 100
+        if 'portal_czasowy' in special_buildings:
+            time_reduction += 75  # Redukuje cooldown
+        if 'centrum_dowodzenia' in special_buildings:
+            mining_boost += 60
+            rare_boost += 30
+
+        # Kopanie!
+        success_chance = min(95, location['success_rate'] + mining_boost // 5)
+
+        if random.randint(1, 100) <= success_chance:
+            # Sukces!
+            base_min, base_max = location['base_reward']
+            # Bonus z poziomu mining
+            level_multiplier = 1 + (mining_level - location['unlock_level']) * 0.1
+            # Bonus z budynków
+            building_multiplier = 1 + mining_boost / 100
+
+            final_min = int(base_min * level_multiplier * building_multiplier)
+            final_max = int(base_max * level_multiplier * building_multiplier)
+
+            mined_dmt = random.randint(final_min, final_max)
+            points = add_points(user_id, mined_dmt)
+
+            # Szansa na rzadkie minerały
+            rare_found = None
+            enhanced_rare_chance = location['rare_chance'] + rare_boost / 10
+
+            if random.randint(1, 100) <= enhanced_rare_chance * 10:
+                # Znaleziono rzadki minerał!
+                available_minerals = [(mineral_id, mineral) for mineral_id, mineral in RARE_MINERALS.items()
+                                    if random.randint(1, 100) <= mineral['chance'] * 10]
+                if available_minerals:
+                    mineral_id, rare_found = random.choice(available_minerals)
+                    rare_bonus = rare_found['value']
+                    points = add_points(user_id, rare_bonus)
+
+                    # Dodaj minerał do inwentarza gracza
+                    user_data = get_user_data_full(user_id)
+                    rare_minerals = user_data.get('rare_minerals_found', {})
+                    rare_minerals[mineral_id] = rare_minerals.get(mineral_id, 0) + 1
+                    user_data['rare_minerals_found'] = rare_minerals
+                    update_user_data(user_id, user_data)
+
+            # Szansa na level up
+            level_up_text = ""
+            if random.randint(1, 10) == 1:  # 5% szansy
+                level_bonus = (mining_level + 1) * 10
+                points = add_points(user_id, level_bonus)  # Zaktualizuj points
+                # Pobierz zaktualizowane dane po dodaniu punktów
+                user_data = get_user_data_full(user_id)
+                user_data['mining_level'] = mining_level + 1
+                level_up_text = f"\n🎉 LEVEL UP! Mining level {mining_level + 1}!\n💎 Bonus: +{level_bonus} punktów!"
+
+            user_data[last_mine_key] = now
+            update_user_data(user_id, user_data)
+
+            result_text = (
+                f"⛏️ **UDANE KOPANIE!**\n\n"
+                f"📍 Lokacja: {location['name']}\n"
+                f"💎 Wykopane DMT: {mined_dmt}\n"
+                f"📊 Szanse: {success_chance}%\n"
+            )
+
+            if rare_found:
+                result_text += f"\n🌟 **RZADKI MINERAŁ!**\n💠 {rare_found['name']} (+{rare_found['value']} DMT)\n📝 {rare_found['description']}\n"
+
+            result_text += f"\n💰 Łącznie punktów: {points}{level_up_text}"
+
+            await update.message.reply_text(result_text, parse_mode='Markdown')
+        else:
+            # Porażka
+            user_data[last_mine_key] = now
+            update_user_data(user_id, user_data)
+
+            await update.message.reply_text(
+                f"💥 **KOPANIE NIEUDANE!**\n\n"
+                f"📍 {location['name']}\n"
+                f"😵 Nic nie znalazłeś tym razem!\n"
+                f"⚠️ Szanse były: {success_chance}%\n\n"
+                f"⏰ Spróbuj ponownie za {location['cooldown']//60} minut!"
+            )
+
+    except Exception as e:
+        logging.error(f"Błąd w advanced_mining: {e}")
+        await update.message.reply_text("❌ Błąd w rozszerzonym kopaniu!")
+
+# === SYSTEM BATTLE (ARENA BITEW) ===
+async def battle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.effective_user.id
+        user_data = get_user_data_full(user_id)
+
+        # Sprawdź rate limiting
+        can_proceed, message = check_rate_limit(user_id, "battle")
+        if not can_proceed:
+            await update.message.reply_text(f"❌ {message}")
+            return
+
+        # Sprawdź cooldown (10 minut)
+        last_battle = user_data.get('last_battle', 0)
+        now = time.time()
+        cooldown = 600  # 10 minut
+
+        if now - last_battle < cooldown:
+            remaining = int(cooldown - (now - last_battle))
+            minutes = remaining // 60
+            seconds = remaining % 60
+            await update.message.reply_text(f"⏰ Następna bitwa za {minutes}m {seconds}s!")
+            return
+
+        # Lista przeciwników
+        enemies = [
+            {"name": "🐷 Papierowa Świnia", "difficulty": 1, "reward": (5, 15), "hp": 30},
+            {"name": "🐺 Szary Wilk", "difficulty": 2, "reward": (10, 25), "hp": 50},
+            {"name": "🦅 Stalowy Orzeł", "difficulty": 3, "reward": (15, 35), "hp": 70},
+            {"name": "🐲 Czerwony Smok", "difficulty": 4, "reward": (25, 50), "hp": 100},
+            {"name": "👑 Boss Kraina", "difficulty": 5, "reward": (40, 80), "hp": 150},
+            {"name": "🤖 Cyber Demon", "difficulty": 6, "reward": (60, 120), "hp": 200},
+            {"name": "👻 Duch Mafii", "difficulty": 7, "reward": (80, 160), "hp": 250},
+            {"name": "⚡ Zeus Mleczny", "difficulty": 8, "reward": (100, 200), "hp": 300}
+        ]
+
+        # Wybierz przeciwnika bazując na poziomie gracza
+        battle_wins = user_data.get('battle_wins', 0)
+        player_level = min(battle_wins // 5 + 1, len(enemies))
+        available_enemies = enemies[:player_level]
+        enemy = random.choice(available_enemies)
+
+        # Oblicz siłę gracza
+        mining_level = user_data.get('mining_level', 1)
+        mafia_respect = user_data.get('mafia_respect', 0)
+        player_power = 50 + mining_level * 10 + mafia_respect // 10
+
+        # Bonusy z budynków
+        special_buildings = user_data.get('special_buildings', [])
+        if 'akademia' in special_buildings:
+            player_power += 30
+        if 'centrum_dowodzenia' in special_buildings:
+            player_power += 50
+
+        # Symulacja bitwy
+        player_hp = 100
+        enemy_hp = enemy["hp"]
+        battle_log = f"⚔️ **ARENA BITEW DON MLEKO**\n\n👤 {update.effective_user.first_name or 'Wojownik'} vs {enemy['name']}\n\n"
+
+        round_num = 1
+        while player_hp > 0 and enemy_hp > 0 and round_num <= 10:
+            # Atak gracza
+            player_damage = random.randint(player_power//3, player_power//2)
+            enemy_hp = max(0, enemy_hp - player_damage)
+            battle_log += f"🗡️ Runda {round_num}: Zadałeś {player_damage} obrażeń! (Przeciwnik: {enemy_hp}HP)\n"
+
+            if enemy_hp <= 0:
+                break
+
+            # Atak przeciwnika
+            enemy_damage = random.randint(enemy["difficulty"] * 5, enemy["difficulty"] * 15)
+            player_hp = max(0, player_hp - enemy_damage)
+            battle_log += f"💥 {enemy['name']} zadał {enemy_damage} obrażeń! (Ty: {player_hp}HP)\n\n"
+
+            round_num += 1
+
+        # Wynik bitwy
+        if player_hp > 0:
+            # Wygrana!
+            reward = random.randint(*enemy["reward"])
+            points, success = add_points_with_limit(user_id, reward)
+
+            user_data['battle_wins'] = user_data.get('battle_wins', 0) + 1
+            user_data['last_battle'] = now
+            update_user_data(user_id, user_data)
+
+            # Sprawdź odznaki
+            if user_data['battle_wins'] >= 10:
+                check_and_award_badge(user_id, "battle_champion")
+
+            battle_log += f"🎉 **ZWYCIĘSTWO!**\n💰 Nagroda: +{reward} DMT\n🏆 Wygrane bitwy: {user_data['battle_wins']}"
+
+            if not success:
+                battle_log += "\n⚠️ Osiągnięto limit punktów za godzinę!"
+
+        else:
+            # Przegrana
+            user_data['last_battle'] = now
+            update_user_data(user_id, user_data)
+
+            battle_log += f"💀 **PRZEGRANA!**\n😵 Zostałeś pokonany przez {enemy['name']}!\n💪 Trenuj więcej i spróbuj ponownie!"
+
+        await update.message.reply_text(battle_log, parse_mode='Markdown')
+
+    except Exception as e:
+        logging.error(f"Błąd w battle: {e}")
+        await update.message.reply_text("❌ Błąd w arenie bitew!")
+
+# Mining System (stary - zachowaj dla kompatybilności)
+async def mine(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.effective_user.id
+        user_data = get_user_data_full(user_id)
+
+        # Sprawdź rate limiting
+        can_proceed, message = check_rate_limit(user_id, "mine")
+        if not can_proceed:
+            await update.message.reply_text(f"❌ {message}")
+            return
+
+        # Sprawdź cooldown (5 minut)
+        last_mine = user_data.get('last_mine', 0)
+        now = time.time()
+        cooldown = 300  # 5 minut
+
+        if now - last_mine < cooldown:
+            remaining = int(cooldown - (now - last_mine))
+            minutes = remaining // 60
+            seconds = remaining % 60
+            await update.message.reply_text(f"⏰ Musisz poczekać {minutes}m {seconds}s przed kolejnym kopaniem!")
+            return
+
+        mining_level = user_data.get('mining_level', 1)
+
+        # Sprawdź super rzadką szansę na DMTB (1:1000000)
+        dmtb_chance = random.randint(1, 1000000)
+
+        if dmtb_chance == 777777:  # Ultra rzadka szansa!
+            # MEGA JACKPOT - DMTB!
+            mega_reward = 1000000
+            points = add_points(user_id, mega_reward)
+
+            # Pobierz zaktualizowane dane po dodaniu punktów
+            user_data = get_user_data_full(user_id)
+            user_data['mining_level'] = min(mining_level + 5, 99)
+            user_data['last_mine'] = now
+
+            # Specjalna odznaka
+            if check_and_award_badge(user_id, "dmtb_finder"):
+                BADGES["dmtb_finder"] = {"name": "🌟 DMTB Finder", "desc": "Wykopał legendarny DMTB!"}
+
+            update_user_data(user_id, user_data)
+
+            # Auto-post o MEGA jackpot
+            username = update.effective_user.first_name or f"Gracz{str(user_id)[-4:]}"
+            auto_create_achievement_post(user_id, username, 'jackpot', f"{mega_reward:,}")
+
+            await update.message.reply_text(
+                f"🌟🌟🌟 MEGA JACKPOT! 🌟🌟🌟\n\n"
+                f"💫 WYKOPAŁEŚ LEGENDARNY DMTB!\n"
+                f"🏆 NAGRODA: {mega_reward:,} punktów!\n"
+                f"⚡ Mining level +5!\n"
+                f"🎖️ Specjalna odznaka: DMTB Finder!\n\n"
+                f"💎 Łącznie punktów: {points:,}\n"
+                f"📈 Szansa była 1:1,000,000!\n\n"
+                f"🐄 Don Mleko jest dumny!"
+            )
+            return
+
+        # Zwykłe kopanie
+        success_chance = min(80, 30 + mining_level * 5)
+
+        if random.randint(1, 100) <= success_chance:
+            # Sukces! - podstawowe nagrody
+            base_reward = random.randint(1, 10) + mining_level
+            
+            # Bonusy z budynków specjalnych
+            special_buildings = user_data.get('special_buildings', [])
+            building_bonus = 0
+            
+            if 'mleczarnia' in special_buildings:
+                building_bonus += int(base_reward * 0.25)  # +25%
+            if 'rakieta_don_mleko' in special_buildings:
+                building_bonus += int(base_reward * 2.0)   # +200%
+            if 'cyber_centrum' in special_buildings:
+                building_bonus += int(base_reward * 0.4)   # +40%
+
+            total_reward = base_reward + building_bonus
+            points, success = add_points_with_limit(user_id, total_reward)
+
+            # Szansa na rzadkie minerały (5% bazowa)
+            rare_found = None
+            rare_chance = 5
+            
+            if 'laboratorium' in special_buildings:
+                rare_chance += 10  # +10% z laboratorium
+            
+            if random.randint(1, 100) <= rare_chance:
+                # Znaleziono rzadki minerał!
+                available_minerals = [(mineral_id, mineral) for mineral_id, mineral in RARE_MINERALS.items()
+                                    if random.randint(1, 1000) <= mineral['chance'] * 10]
+                if available_minerals:
+                    mineral_id, rare_found = random.choice(available_minerals)
+                    rare_bonus = rare_found['value']
+                    points = add_points(user_id, rare_bonus)
+
+                    # Dodaj minerał do inwentarza gracza
+                    user_data = get_user_data_full(user_id)
+                    rare_minerals = user_data.get('rare_minerals_found', {})
+                    rare_minerals[mineral_id] = rare_minerals.get(mineral_id, 0) + 1
+                    user_data['rare_minerals_found'] = rare_minerals
+                    update_user_data(user_id, user_data)
+
+            # Szansa na level up (10% szansy)
+            level_up_text = ""
+            if random.randint(1, 10) == 1:
+                level_bonus = (mining_level + 1) * 10
+                points = add_points(user_id, level_bonus)
+                # Pobierz zaktualizowane dane po dodaniu punktów
+                user_data = get_user_data_full(user_id)
+                user_data['mining_level'] = mining_level + 1
+                level_up_text = f"\n🎉 LEVEL UP! Mining level {mining_level + 1}!\n💎 Bonus: +{level_bonus} punktów!"
+
+            # Zaktualizuj last_mine
+            user_data = get_user_data_full(user_id)
+            user_data['last_mine'] = now
+            update_user_data(user_id, user_data)
+
+            # Sprawdź odznakę minera
+            if mining_level >= 5:
+                check_and_award_badge(user_id, "miner")
+
+            result_text = (
+                f"⛏️ **UDANE KOPANIE!**\n\n"
+                f"💎 Wykopane DMT: {total_reward}\n"
+                f"📊 Szanse: {success_chance}%\n"
+                f"⛏️ Mining level: {mining_level}\n"
+            )
+
+            if building_bonus > 0:
+                result_text += f"🏗️ Bonus z budynków: +{building_bonus} DMT\n"
+
+            if rare_found:
+                result_text += f"\n🌟 **RZADKI MINERAŁ!**\n💠 {rare_found['name']} (+{rare_found['value']} DMT)\n📝 {rare_found['description']}\n"
+
+            result_text += f"\n💰 Łącznie punktów: {points}{level_up_text}"
+
+            if not success:
+                result_text += "\n⚠️ Osiągnięto limit punktów za godzinę!"
+
+            await update.message.reply_text(result_text, parse_mode='Markdown')
+        else:
+            # Porażka
+            user_data = get_user_data_full(user_id)
+            user_data['last_mine'] = now
+            update_user_data(user_id, user_data)
+
+            await update.message.reply_text(
+                f"💥 **KOPANIE NIEUDANE!**\n\n"
+                f"😵 Nic nie znalazłeś tym razem!\n"
+                f"⚠️ Szanse były: {success_chance}%\n"
+                f"⛏️ Mining level: {mining_level}\n\n"
+                f"⏰ Spróbuj ponownie za 5 minut!\n"
+                f"💡 Wyższy mining level = lepsze szanse!"
+            )
+
+    except Exception as e:
+        logging.error(f"Błąd w mine: {e}")
+        await update.message.reply_text("❌ Błąd w kopalni!")
+
+# Slot Machine (bez zmian)
+async def slots(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.effective_user.id
+        user_data = get_user_data_full(user_id)
+
+        # Koszt gry
+        cost = 5
+        if user_data.get('points', 0) < cost:
+            await update.message.reply_text(f"❌ Potrzebujesz {cost} punktów aby zagrać w slots!")
+            return
+
+        # Zabierz punkty
+        add_points(user_id, -cost)
+
+        # Symbole
+        symbols = ["🐄", "💎", "🥛", "🚀", "🌙", "⭐"]
+
+        # Losuj 3 symbole
+        result = [random.choice(symbols) for _ in range(3)]
+
+        # Sprawdź wygraną
+        if result[0] == result[1] == result[2]:
+            if result[0] == "🐄":
+                win = 100
+            elif result[0] == "💎":
+                win = 50
+            elif result[0] == "🚀":
+                win = 30
+            else:
+                win = 20
+
+            final_points = add_points(user_id, win)
+            message = f"🎉 JACKPOT! {' '.join(result)}\n💰 Wygrałeś: {win} punktów!"
+        elif result[0] == result[1] or result[1] == result[2] or result[0] == result[2]:
+            win = 10
+            final_points = add_points(user_id, win)
+            message = f"🎊 Para! {' '.join(result)}\n💰 Wygrałeś: {win} punktów!"
+        else:
+            win = 0
+            final_points = get_user_points(user_id)  # Pobierz aktualne punkty
+            message = f"💀 Przegrana! {' '.join(result)}\n😢 Spróbuj ponownie!"
+
+        await update.message.reply_text(
+            f"🎰 SLOTS DON MLEKO 🎰\n\n"
+            f"{message}\n\n"
+            f"💎 Twoje punkty: {final_points}\n"
+            f"💸 Koszt gry: {cost} punktów"
+        )
+    except Exception as e:
+        logging.error(f"Błąd w slots: {e}")
+        await update.message.reply_text("❌ Błąd w automacie!")
+
+# Ruleta (bez zmian)
+async def roulette(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.effective_user.id
+
+        if not context.args or len(context.args) != 2:
+            await update.message.reply_text(
+                "🎯 RULETA DON MLEKO!\n\n"
+                "Użycie: /roulette [stawka] [kolor]\n\n"
+                "Kolory:\n"
+                "🔴 red - x2 (47% szans)\n"
+                "⚫ black - x2 (47% szans)\n"
+                "🟢 green - x14 (6% szans)\n\n"
+                "Przykład: /roulette 10 red"
+            )
+            return
+
+        try:
+            bet = int(context.args[0])
+            color = context.args[1].lower()
+        except ValueError:
+            await update.message.reply_text("❌ Stawka musi być liczbą!")
+            return
+
+        if color not in ['red', 'black', 'green']:
+            await update.message.reply_text("❌ Dostępne kolory: red, black, green")
+            return
+
+        user_data = get_user_data_full(user_id)
+        if user_data.get('points', 0) < bet:
+            await update.message.reply_text("❌ Nie masz wystarczająco punktów!")
+            return
+
+        if bet < 1 or bet > 100:
+            await update.message.reply_text("❌ Stawka musi być między 1 a 100 punktów!")
+            return
+
+        # Zabierz stawkę
+        add_points(user_id, -bet)
+
+        # Losuj wynik
+        roulette_number = random.randint(0, 36)
+
+        if roulette_number == 0:
+            winning_color = "green"
+            color_emoji = "🟢"
+        elif roulette_number % 2 == 1:
+            winning_color = "red"
+            color_emoji = "🔴"
+        else:
+            winning_color = "black"
+            color_emoji = "⚫"
+
+        # Sprawdź wygraną
+        if color == winning_color:
+            if color == "green":
+                winnings = bet * 14
+            else:
+                winnings = bet * 2
+
+            final_points = add_points(user_id, winnings)
+
+            await update.message.reply_text(
+                f"🎉 WYGRANA!\n\n"
+                f"🎯 Wypadło: {roulette_number} {color_emoji}\n"
+                f"💰 Wygrałeś: {winnings} punktów!\n"
+                f"💎 Masz teraz: {final_points} punktów"
+            )
+        else:
+            current_points = get_user_points(user_id)  # Pobierz aktualne punkty
+            await update.message.reply_text(
+                f"💀 PRZEGRANA!\n\n"
+                f"🎯 Wypadło: {roulette_number} {color_emoji}\n"
+                f"💸 Straciłeś: {bet} punktów\n"
+                f"💎 Masz teraz: {current_points} punktów"
+            )
+    except Exception as e:
+        logging.error(f"Błąd w roulette: {e}")
+        await update.message.reply_text("❌ Błąd w rulecie!")
+
+# --- Pobieranie kursu (RZECZYWISTY KURS DMT) ---
+async def get_price():
+    """Pobiera kurs DMT z fallback na symulowany kurs"""
+    try:
+        # Najpierw spróbuj z prawdziwym API (poprawiony URL)
+        timeout = aiohttp.ClientTimeout(total=8, connect=3, sock_read=5)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            # Poprawiony URL API
+            url = "https://api.dexscreener.com/latest/dex/pairs/bsc/0x067DEAB2f36aD3c1e267849a1672C1735A788ccf"
+
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+
+            async with session.get(url, headers=headers) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data and "pair" in data and data["pair"]:
+                        pair_data = data["pair"]
+
+                        price_usd = pair_data.get("priceUsd", "0")
+                        price_change_24h = pair_data.get("priceChange", {}).get("h24", 0)
+
+                        # Bezpieczne formatowanie
+                        try:
+                            price_float = float(price_usd)
+                            if price_float < 0.000001:
+                                formatted_price = f"{price_float:.10f}"
+                            elif price_float < 0.001:
+                                formatted_price = f"{price_float:.8f}"
+                            else:
+                                formatted_price = f"{price_float:.6f}"
+                        except:
+                            formatted_price = "0.000001"
+
+                        # Trend emoji
+                        try:
+                            change_val = float(price_change_24h)
+                            if change_val > 0:
+                                trend_emoji = "📈"
+                                change_text = f"+{change_val:.2f}%"
+                            elif change_val < 0:
+                                trend_emoji = "📉"
+                                change_text = f"{change_val:.2f}%"
+                            else:
+                                trend_emoji = "➡️"
+                                change_text = "0%"
+                        except:
+                            trend_emoji = "📊"
+                            change_text = "N/A"
+
+                        return (
+                            f"💎 **DON MLEKO TOKEN (DMT)**\n\n"
+                            f"💰 **Cena:** ${formatted_price}\n"
+                            f"{trend_emoji} **24h:** {change_text}\n"
+                            f"🔗 **BSC:** 0x067DEAB2f36aD3c1e267849a1672C1735A788ccf\n"
+                            f"📈 **DexScreener:** [Zobacz wykres](https://dexscreener.com/bsc/0x067DEAB2f36aD3c1e267849a1672C1735A788ccf)\n\n"
+                            f"🐄 **Don Mleko zawsze na szczycie!**"
+                        )
+
+    except Exception as e:
+        logging.warning(f"API error (kontynuuję z fallback): {e}")
+
+    # Zawsze działający fallback z symulowanym kursem
+    mock_price = f"0.0000{random.randint(100, 999)}"
+    trend_options = ["📈 +5.2%", "📉 -2.1%", "➡️ 0%", "📈 +12.8%", "📉 -7.3%"]
+    trend = random.choice(trend_options)
+
+    return (
+        f"📊 **DON MLEKO TOKEN (DMT)**\n\n"
+        f"💰 **Cena:** ${mock_price}\n"
+        f"{trend}\n"
+        f"🔗 **BSC:** 0x067DEAB2f36aD3c1e267849a1672C1735A788ccf\n"
+        f"📈 **DexScreener:** [Zobacz wykres](https://dexscreener.com/bsc/0x067DEAB2f36aD3c1e267849a1672C1735A788ccf)\n\n"
+        f"💡 **Demo Mode** - prawdziwy kurs wkrótce!\n"
+        f"🐄 **Don Mleko zawsze na szczycie!**"
+    )
+
+def check_and_award_badge(user_id, badge_type):
+    try:
+        user_data = get_user_data_full(user_id)
+        badges = user_data.get('badges', [])
+
+        if badge_type not in badges:
+            badges.append(badge_type)
+            user_data['badges'] = badges
+            update_user_data(user_id, user_data)
+            return True
+        return False
+    except Exception as e:
+        logging.error(f"Błąd w check_and_award_badge: {e}")
+        return False
+
+def get_user_rank(points):
+    if points >= 500:
+        return "👑 Legenda rodziny"
+    elif points >= 100:
+        return "💎 Diamond Hands"
+    elif points >= 50:
+        return "🥇 Don Mleko VIP"
+    elif points >= 25:
+        return "🥈 Kapitan rodziny"
+    elif points >= 10:
+        return "🥉 Zaufany członek"
+    else:
+        return "🐄 Nowy w rodzinie"
+
+# --- Podstawowe komendy ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.effective_user.id
+
+        # Sprawdź rate limiting
+        can_proceed, message = check_rate_limit(user_id, "start")
+        if not can_proceed:
+            await update.message.reply_text(f"❌ {message}")
+            return
+
+        keyboard = [
+            [InlineKeyboardButton("💎 DMT Shop", callback_data="dmt_shop"), InlineKeyboardButton("🔗 Połącz Portfel", callback_data="link_wallet")],
+            [InlineKeyboardButton("📊 Sprawdź Blockchain", callback_data="check_blockchain")],
+            [InlineKeyboardButton("🌐 Oficjalna Strona + Gry", url="https://donmlekotoken.netlify.app")],
+            [InlineKeyboardButton("🔗 Linktree", url="https://linktr.ee/donmlekotoken")],
+            [InlineKeyboardButton("🎥 TikTok", url="https://www.tiktok.com/@donmlekotoken0")],
+            [InlineKeyboardButton("💎 DexScreener", url="https://dexscreener.com/bsc/0x1fAc48db5079567D8769c9f1c16b228DB435C018")],
+            [InlineKeyboardButton("📱 Telegram", url="https://t.me/donmlekotoken")],
+            [InlineKeyboardButton("🐦 Twitter", url="https://twitter.com/donmlekotoken")],
+            [InlineKeyboardButton("📸 Instagram", url="https://instagram.com/donmlekotoken")],
+            [InlineKeyboardButton("💬 Discord", url="https://discord.gg/donmleko")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        points, success = add_points_with_limit(user_id, 1)
+
+        # Sprawdź czy użytkownik ma już odznakę newbie
+        user_data = get_user_data_full(user_id)
+        if "newbie" not in user_data.get('badges', []):
+            if check_and_award_badge(user_id, "newbie"):
+                badge_text = f"\n🎉 Zdobyłeś odznakę: {BADGES['newbie']['name']}!"
+            else:
+                badge_text = ""
+        else:
+            badge_text = ""
+
+        # Dodaj losowy emotikon Don Mleko
+        don_mleko_moods = ["🐄😎", "🐄💪", "🐄🚀", "🐄👑", "🐄💎"]
+        mood = random.choice(don_mleko_moods)
+
+        # Losowa motywacyjna wiadomość
+        motivational = [
+            "Rodzina zawsze patrzy! 👀💣",
+            "Diamond Hands to podstawa! 💎✋",
+            "Do księżyca i dalej! 🚀🌙",
+            "HODL jak prawdziwy wojownik! ⚔️",
+            "Moc jest z tobą! 🔥💪"
+        ]
+        motivation = random.choice(motivational)
+
+        points_text = f"💎 Twoje punkty: {points}"
+        if not success:
+            points_text += " ⚠️ (limit osiągnięty)"
+
+        text = (
+            f"{mood} Don Mleko mówi:\n"
+            f"{motivation}\n\n"
+            f"{points_text}{badge_text}\n\n"
+            f"📊 PODSTAWOWE KOMENDY:\n"
+            f"🏠 /start - Menu główne (+1 pkt)\n"
+            f"📊 /kurs - Aktualny kurs DMT (+2 pkt)\n"
+            f"😂 /mem - Losowy mem/GIF (+1 pkt)\n"
+            f"📅 /daily - Codzienne nagrody (streak system!)\n\n"
+            f"⚔️ KLASYCZNE GIER:\n"
+            f"⚔️ /battle - Arena bitew (PvE)\n"
+            f"⛏️ /mine - Kopalnia DMT (co 5min)\n"
+            f"🎰 /slots - Automat (koszt 5 pkt)\n"
+            f"🎯 /roulette [stawka] [kolor] - Ruleta\n\n"
+            f"🤵 SYSTEM MAFII:\n"
+            f"👥 /mafia - Menu główne mafii\n"
+            f"🎯 /missions [numer] - Wykonaj misję (cooldown 30min)\n"
+            f"💰 /heist - Napad na bank (cooldown 1h)\n"
+            f"🏰 /territory [numer] - Kup terytorium (pasywny dochód)\n"
+            f"🛡️ /protection - Zbierz haracze\n\n"
+            f"🎲 NOWE MINI GIRY:\n"
+            f"🃏 /blackjack [stawka] - Karciana gra 21\n"
+            f"🎲 /dice [stawka] [suma] - Gra w kości\n"
+            f"🚀 /crash [stawka] [multiplier] - Crash Game\n"
+            f"🎡 /wheel [stawka] - Koło fortuny\n\n"
+            f"📊 STATYSTYKI:\n"
+            f"💎 /punkty - Twoje punkty i ranga\n"
+            f"📈 /stats - Szczegółowe statystyki\n"
+            f"🏆 /ranking - TOP 15 rodziny\n"
+            f"🤖 /botstats - Statystyki całego bota\n\n"
+            f"📱 SYSTEM SPOŁECZNOŚCIOWY:\n"
+            f"📰 /feed - Najnowsze posty rodziny\n"
+            f"📝 /post [typ] [tytuł] [treść] - Napisz post\n"
+            f"📖 /read [id] - Czytaj pełny post\n"
+            f"👍 /like [id] - Polub post\n"
+            f"💬 /comment [id] [treść] - Skomentuj (lub /c)\n"
+            f"📋 /myposts - Twoje posty\n\n"
+            f"🌟 SUPER FUNKCJE:\n"
+            f"🎫 /lottery - Super loteria (raz dziennie)\n"
+            f"🌀 /timetravel - Portal czasowy (pomiń cooldown'y)\n"
+            f"🚀 /megaboost - Aktywuj mega bonusy\n"
+            f"💫 /godmode - Tryb boga (dla legend)\n\n"
+            f"🏛️ SYSTEM GILDII:\n"
+            f"🏛️ /guild - Menu gildii\n"
+            f"🏛️ /guild create [nazwa] - Utwórz gildię (1000 DMT)\n"
+            f"🏛️ /guild list - Lista dostępnych gildii\n"
+            f"🏛️ /guild join [id] - Dołącz do gildii\n\n"
+            f"📚 HISTORIE DON MLEKO:\n"
+            f"📖 /historia - Pełna historia Don Mleka\n"
+            f"🦌 /rogacz - Legenda Białego Rogacza\n"
+            f"💀 /lactosa - Masakra w mleczarni\n"
+            f"🥛 /milo - Historia przed sławą\n"
+            f"🔴 /kefir - Historia zdrajcy\n\n"
+            f"🔗 **BLOCKCHAIN INTEGRATION:**\n"
+            f"💎 /dmtshop - Ekskluzywny sklep dla inwestorów\n"
+            f"🔗 /linkwallet [adres] - Połącz portfel BSC\n"
+            f"📊 /checkpurchases - Sprawdź zakupy DMT\n"
+            f"🎯 /blockchain - Status blockchain\n\n"
+            f"🎁 **KORZYŚCI BLOCKCHAIN:**\n"
+            f"• 1 kupiony DMT = 10 DMT w grze\n"
+            f"• Ekskluzywne przedmioty w sklepie\n"
+            f"• Automatyczne wykrywanie transakcji\n"
+            f"• Specjalne odznaki i bonusy\n\n"
+            f"🌐 Sprawdź również gry na stronie!\n"
+            f"🐄 Don Mleko teraz z blockchain integration!"
+        )
+
+        await update.message.reply_text(text, reply_markup=reply_markup)
+    except Exception as e:
+        logging.error(f"Błąd w start: {e}")
+        await update.message.reply_text("🐄 Witaj w rodzinie Don Mleko!")
+
+async def kurs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.effective_user.id
+
+        # Sprawdź rate limiting
+        can_proceed, message = check_rate_limit(user_id, "kurs")
+        if not can_proceed:
+            await update.message.reply_text(f"❌ {message}")
+            return
+
+        points, success = add_points_with_limit(user_id, 2)
+        message = await get_price()
+
+        if success:
+            await update.message.reply_text(f"{message}\n💎 +2 punkty! Masz: {points}")
+        else:
+            await update.message.reply_text(f"{message}\n⚠️ Limit punktów osiągnięty! Masz: {points}")
+    except Exception as e:
+        logging.error(f"Błąd w kurs: {e}")
+        await update.message.reply_text("❌ Chwilowy problem z kursem!")
+
+async def mem(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.effective_user.id
+
+        # Sprawdź rate limiting
+        can_proceed, message = check_rate_limit(user_id, "mem")
+        if not can_proceed:
+            await update.message.reply_text(f"❌ {message}")
+            return
+
+        points, success = add_points_with_limit(user_id, 1)
+
+        if random.choice([True, False]):
+            mem_text = random.choice(MEMY)
+            if success:
+                await update.message.reply_text(f"{mem_text}\n\n💎 +1 punkt! Masz: {points}")
+            else:
+                await update.message.reply_text(f"{mem_text}\n\n⚠️ Limit punktów osiągnięty! Masz: {points}")
+        else:
+            gif_url = random.choice(GIFY)
+            try:
+                caption = f"🐄 Don Mleko GIF!\n💎 +1 punkt! Masz: {points}" if success else f"🐄 Don Mleko GIF!\n⚠️ Limit punktów osiągnięty! Masz: {points}"
+                await update.message.reply_animation(
+                    animation=gif_url,
+                    caption=caption
+                )
+            except:
+                mem_text = random.choice(MEMY)
+                if success:
+                    await update.message.reply_text(f"{mem_text}\n\n💎 +1 punkt! Masz teraz: {points}")
+                else:
+                    await update.message.reply_text(f"{mem_text}\n\n⚠️ Limit punktów osiągnięty! Masz: {points}")
+    except Exception as e:
+        logging.error(f"Błąd w mem: {e}")
+        await update.message.reply_text("🐄 Don Mleko ma problem z memami!")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.effective_user.id
+        user_data = get_user_data_full(user_id)
+        points = user_data.get('points', 0)
+
+        # Personalizowane powitanie bazujące na punktach
+        if points >= 500:
+            greeting = "👑 Legendo rodziny!"
+        elif points >= 100:
+            greeting = "💎 Diamond Hand!"
+        elif points >= 50:
+            greeting = "🥇 VIP członku!"
+        else:
+            greeting = "🐄 Członku rodziny!"
+
+        await update.message.reply_text(
+            f"{greeting} Don Mleko Bot - MEGA PRZEWODNIK:\n\n"
+            f"📈 PODSTAWOWE KOMENDY:\n"
+            f"🏠 /start - Menu główne (+1 pkt)\n"
+            f"📊 /kurs - Aktualny kurs DMT (+2 pkt)\n"
+            f"😂 /mem - Losowy mem/GIF (+1 pkt)\n"
+            f"📅 /daily - Codzienne nagrody (streak system!)\n\n"
+            f"⚔️ KLASYCZNE GIER:\n"
+            f"⚔️ /battle - Arena bitew (PvE)\n"
+            f"⛏️ /mine - Kopalnia DMT (co 5min)\n"
+            f"🎰 /slots - Automat (koszt 5 pkt)\n"
+            f"🎯 /roulette [stawka] [kolor] - Ruleta\n\n"
+            f"🤵 SYSTEM MAFII:\n"
+            f"👥 /mafia - Menu główne mafii\n"
+            f"🎯 /missions [numer] - Wykonaj misję (cooldown 30min)\n"
+            f"💰 /heist - Napad na bank (cooldown 1h)\n"
+            f"🏰 /territory [numer] - Kup terytorium (pasywny dochód)\n"
+            f"🛡️ /protection - Zbierz haracze\n\n"
+            f"🎲 NOWE MINI GIRY:\n"
+            f"🃏 /blackjack [stawka] - Karciana gra 21\n"
+            f"🎲 /dice [stawka] [suma] - Gra w kości\n"
+            f"🚀 /crash [stawka] [multiplier] - Crash Game\n"
+            f"🎡 /wheel [stawka] - Koło fortuny\n\n"
+            f"📊 STATYSTYKI:\n"
+            f"💎 /punkty - Twoje punkty i ranga\n"
+            f"📈 /stats - Szczegółowe statystyki\n"
+            f"🏆 /ranking - TOP 15 rodziny\n"
+            f"🤖 /botstats - Statystyki całego bota\n\n"
+            f"📱 SYSTEM SPOŁECZNOŚCIOWY:\n"
+            f"📰 /feed - Najnowsze posty rodziny\n"
+            f"📝 /post [typ] [tytuł] [treść] - Napisz post\n"
+            f"📖 /read [id] - Czytaj pełny post\n"
+            f"👍 /like [id] - Polub post\n"
+            f"💬 /comment [id] [treść] - Skomentuj (lub /c)\n"
+            f"📋 /myposts - Twoje posty\n\n"
+            f"🌟 SUPER FUNKCJE:\n"
+            f"🎫 /lottery - Super loteria (raz dziennie)\n"
+            f"🌀 /timetravel - Portal czasowy (pomiń cooldown'y)\n"
+            f"🚀 /megaboost - Aktywuj mega bonusy\n"
+            f"💫 /godmode - Tryb boga (dla legend)\n\n"
+            f"🏛️ SYSTEM GILDII:\n"
+            f"🏛️ /guild - Menu gildii\n"
+            f"🏛️ /guild create [nazwa] - Utwórz gildię (1000 DMT)\n"
+            f"🏛️ /guild list - Lista dostępnych gildii\n"
+            f"🏛️ /guild join [id] - Dołącz do gildii\n\n"
+            f"📚 HISTORIE DON MLEKO:\n"
+            f"📖 /historia - Pełna historia Don Mleka\n"
+            f"🦌 /rogacz - Legenda Białego Rogacza\n"
+            f"💀 /lactosa - Masakra w mleczarni\n"
+            f"🥛 /milo - Historia przed sławą\n"
+            f"🔴 /kefir - Historia zdrajcy\n\n"
+            f"🔗 **BLOCKCHAIN INTEGRATION:**\n"
+            f"💎 /dmtshop - Ekskluzywny sklep dla inwestorów\n"
+            f"🔗 /linkwallet [adres] - Połącz portfel BSC\n"
+            f"📊 /checkpurchases - Sprawdź zakupy DMT\n"
+            f"🎯 /blockchain - Status blockchain\n\n"
+            f"🎁 **KORZYŚCI BLOCKCHAIN:**\n"
+            f"• 1 kupiony DMT = 10 DMT w grze\n"
+            f"• Ekskluzywne przedmioty w sklepie\n"
+            f"• Automatyczne wykrywanie transakcji\n"
+            f"• Specjalne odznaki i bonusy\n\n"
+            f"🌐 Sprawdź również gry na stronie!\n"
+            f"🐄 Don Mleko teraz rządzi miastem!"
+        )
+    except Exception as e:
+        logging.error(f"Błąd w help: {e}")
+        await update.message.reply_text("❌ Błąd w pomocy!")
+
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to monitor suspicious activity"""
+    try:
+        user_id = update.effective_user.id
+
+        # Lista adminów (dodaj swoje ID)
+        ADMIN_IDS = [123456789, 987654321]  # Zastąp prawdziwymi ID adminów
+
+        if user_id not in ADMIN_IDS:
+            await update.message.reply_text("❌ Brak uprawnień administratora!")
+            return
+
+        data = load_user_data()
+        suspicious_users = []
+
+        now = time.time()
+
+        for uid,user_data in data.items():
+            tracking = user_data.get('activity_tracking', {})
+
+            # Sprawdź podejrzaną aktywność
+            commands_per_min = tracking.get('commands_count', 0)
+            points_per_hour = tracking.get('points_earned_hour', 0)
+            intervals = tracking.get('command_intervals', [])
+
+            is_suspicious = False
+            reasons = []
+
+            if commands_per_min > 15:
+                is_suspicious = True
+                reasons.append(f"🚨 {commands_per_min} komend/min")
+
+            if points_per_hour > 150:
+                is_suspicious = True
+                reasons.append(f"💎 {points_per_hour} pkt/h")
+
+            if intervals and len(intervals) >= 3:
+                avg_interval = sum(intervals) / len(intervals)
+                if avg_interval < 3:
+                    is_suspicious = True
+                    reasons.append(f"⚡ Avg {avg_interval:.1f}s/cmd")
+
+            if is_suspicious:
+                try:
+                    chat_member = await update.get_bot().get_chat(uid)
+                    username = chat_member.first_name or f"User{uid[-4:]}"
+                except:
+                    username = f"User{uid[-4:]}"
+
+                suspicious_users.append({
+                    'id': uid,
+                    'name': username,
+                    'reasons': reasons,
+                    'points': user_data.get('points', 0)
+                })
+
+        if suspicious_users:
+            report = "🚨 **RAPORT PODEJRZANEJ AKTYWNOŚCI:**\n\n"
+            for user in suspicious_users[:10]:  # Top 10
+                report += f"👤 {user['name']} (ID: {user['id'][-4:]})\n"
+                report += f"💎 Punkty: {user['points']}\n"
+                report += f"⚠️ Powody: {', '.join(user['reasons'])}\n\n"
+        else:
+            report = "✅ **Brak podejrzanej aktywności!**\n\n"
+            report += "Wszyscy użytkownicy działają normalnie."
+
+        await update.message.reply_text(report, parse_mode='Markdown')
+
+    except Exception as e:
+        logging.error(f"Błąd w admin_stats: {e}")
+        await update.message.reply_text("❌ Błąd w raporcie administratora!")
+
+async def punkty(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.effective_user.id
+        points = get_user_points(user_id)
+        username = update.effective_user.first_name or "Członek rodziny"
+        rank = get_user_rank(points)
+
+        # Losowe motywacyjne wiadomości bazujące na punktach
+        if points >= 500:
+            motivation = random.choice([
+                "Jesteś legendą! 👑✨",
+                "Don Mleko jest dumny! 🐄💪",
+                "Król/Królowa rodziny! 👑🏆"
+            ])
+        elif points >= 100:
+            motivation = random.choice([
+                "Diamond Hands w akcji! 💎🔥",
+                "Prawdziwy HODLer! 🚀💪",
+                "Rodzina liczy na Ciebie! 🐄💎"
+            ])
+        elif points >= 50:
+            motivation = random.choice([
+                "Świetnie Ci idzie! 🔥⭐",
+                "Na dobrej drodze! 🚀💫",
+                "Don Mleko Cię docenia! 🐄👏"
+            ])
+        else:
+            motivation = random.choice([
+                "Dopiero zaczynasz! 💪🌟",
+                "Każdy punkt się liczy! 💎✨",
+                "Trening czyni mistrza! 🏆⚡"
+            ])
+
+        # Dodaj progress bar
+        progress_bars = {
+            500: "████████████████████ 100%",
+            100: "████████████████░░░░ 80%",
+            50: "██████████░░░░░░░░░░ 50%",
+            25: "█████░░░░░░░░░░░░░░░ 25%",
+            10: "██░░░░░░░░░░░░░░░░░░ 10%",
+            0: "░░░░░░░░░░░░░░░░░░░░ 0%"
+        }
+
+        progress = "░░░░░░░░░░░░░░░░░░░░ 0%"
+        for threshold, bar in progress_bars.items():
+            if points >= threshold:
+                progress = bar
+                break
+
+        await update.message.reply_text(
+            f"💎 **{username}** - Raport stanu!\n\n"
+            f"🏆 **Punkty:** {points} DMT\n"
+            f"👑 **Ranga:** {rank}\n"
+            f"📊 **Progress:** {progress}\n\n"
+            f"💫 {motivation}\n\n"
+            f"🎯 **Następny cel:**\n"
+            f"{'👑 Jesteś już legendą!' if points >= 500 else f'• {500 - points} pkt do Legendy 👑' if points >= 100 else f'• {100 - points} pkt do Diamond Hands 💎' if points >= 50 else f'• {50 - points} pkt do VIP 🥇'}"
+        )
+    except Exception as e:
+        logging.error(f"Błąd w punkty: {e}")
+        await update.message.reply_text("❌ Błąd przy pobieraniu punktów!")
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.effective_user.id
+        user_data = get_user_data_full(user_id)
+        username = update.effective_user.first_name or "Członek rodziny"
+
+        points = user_data.get('points', 0)
+        badges = user_data.get('badges', [])
+        battle_wins = user_data.get('battle_wins', 0)
+        mining_level = user_data.get('mining_level', 1)
+
+        # Statystyki mafii
+        mafia_respect = user_data.get('mafia_respect', 0)
+        mafia_rank = get_mafia_rank(mafia_respect)
+        contracts = user_data.get('contracts_completed', 0)
+
+        # Statystyki gier
+        blackjack_wins = user_data.get('blackjack_wins', 0)
+        dice_wins = user_data.get('dice_wins', 0)
+
+        rank = get_user_rank(points)
+
+        if badges:
+            badges_text = "\n🏅 Odznaki:\n"
+            for badge in badges:
+                if badge in BADGES:
+                    badges_text += f"• {BADGES[badge]['name']}\n"
+        else:
+            badges_text = "\n🏅 Brak odznak"
+
+        stats_text = (
+            f"📊 **Statystyki {username}:**\n\n"
+            f"💎 Punkty: {points}\n"
+            f"👑 Ranga: {rank}\n"
+            f"⚔️ Wygrane bitwy: {battle_wins}\n"
+            f"⛏️ Mining level: {mining_level}\n\n"
+            f"🤵 **MAFIA:**\n"
+            f"👤 Ranga: {mafia_rank}\n"
+            f"⭐ Szacunek: {mafia_respect}\n"
+            f"🎯 Kontrakty: {contracts}\n\n"
+            f"🎲 **GIER:**\n"
+            f"🃏 Blackjack: {blackjack_wins} wygranych\n"
+            f"🎲 Kości: {dice_wins} wygranych\n"
+            f"{badges_text}"
+        )
+
+        await update.message.reply_text(stats_text, parse_mode='Markdown')
+    except Exception as e:
+        logging.error(f"Błąd w stats: {e}")
+        await update.message.reply_text("❌ Błąd przy statystykach!")
+
+async def ranking(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        data = load_user_data()
+        if not data:
+            await update.message.reply_text("🐄 Ranking jest pusty! Bądź pierwszy!")
+            return
+
+        # Pobierz informacje o użytkownikach wraz z ich danymi
+        users_with_info = []
+        for user_id, user_data in data.items():
+            # Zawsze dodaj użytkownika do listy, niezależnie od błędów API
+            try:
+                # Próbuj pobrać info o użytkowniku z Telegram API
+                chat_member = await update.get_bot().get_chat(user_id)
+                username = chat_member.first_name or f"Gracz {user_id[-4:]}"
+            except:
+                # Jeśli nie można pobrać, użyj czytelną nazwę
+                username = f"Gracz {user_id[-4:]}"
+
+            # Dodaj tylko użytkowników którzy mają punkty (aktywni)
+            if user_data.get('points', 0) > 0:
+                users_with_info.append((user_id, user_data, username))
+
+        # Sortuj według punktów
+        sorted_users = sorted(users_with_info, key=lambda x: x[1]['points'], reverse=True)[:15]
+
+        ranking_text = "🏆 **TOP 15 RODZINY DON MLEKO:**\n\n"
+
+        # Dodaj emoji dla różnych pozycji
+        position_emojis = {
+            1: "🥇", 2: "🥈", 3: "🥉", 4: "🏅", 5: "🏅",
+            6: "⭐", 7: "⭐", 8: "⭐", 9: "💫", 10: "💫"
+        }
+
+        for i, (user_id, user_data, username) in enumerate(sorted_users, 1):
+            points = user_data['points']
+            battles = user_data.get('battle_wins', 0)
+            mining_lvl = user_data.get('mining_level', 1)
+            mafia_rank = get_mafia_rank(user_data.get('mafia_respect', 0))
+
+            # Emoji dla pozycji
+            emoji = position_emojis.get(i, f"{i}.")
+
+            # Specjalne oznaczenia
+            special = ""
+            if points >= 500:
+                special = " 👑"
+            elif mafia_rank == 'Don':
+                special = " 🤵"
+            elif points >= 100:
+                special = " 💎"
+            elif battles >= 10:
+                special = " ⚔️"
+            elif mining_lvl >= 5:
+                special = " ⛏️"
+
+            ranking_text += f"{emoji} **{username}**{special}\n"
+            ranking_text += f"    💎 {points} pkt | ⚔️ {battles} | ⛏️ Lvl{mining_lvl} | 🤵 {mafia_rank}\n\n"
+
+        # Dodaj informację o aktualnym użytkowniku
+        current_user_id = str(update.effective_user.id)
+        if current_user_id in data:
+            # Znajdź pozycję użytkownika w pełnym rankingu (wszyscy użytkownicy z punktami)
+            all_sorted = sorted(users_with_info, key=lambda x: x[1]['points'], reverse=True)
+            user_position = next((i for i, (uid, _, _) in enumerate(all_sorted, 1) if uid == current_user_id), None)
+
+            if user_position:
+                current_points = data[current_user_id].get('points', 0)
+                if user_position <= 15:
+                    ranking_text += f"📍 **Twoja pozycja: #{user_position}** ({current_points} pkt)"
+                else:
+                    ranking_text += f"📍 **Twoja pozycja: #{user_position}** ({current_points} pkt) - poza TOP 15"
+            else:
+                ranking_text += "📍 **Nie jesteś jeszcze w rankingu!** (0 punktów)"
+
+        else:
+            ranking_text += "📍 **Nie jesteś jeszcze zarejestrowany!**"
+
+
+        # Dodaj statystyki ogólne
+        total_active = len(users_with_info)
+        ranking_text += f"\n\n👥 **Łącznie aktywnych graczy: {total_active}**"
+
+        await update.message.reply_text(ranking_text, parse_mode='Markdown')
+    except Exception as e:
+        logging.error(f"Błąd w ranking: {e}")
+        await update.message.reply_text("❌ Błąd w rankingu!")
+
+async def bot_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        data = load_user_data()
+
+        # Podstawowe statystyki
+        total_users = len(data)
+        total_points = sum(user_data.get('points', 0) for user_data in data.values())
+
+        # Statystyki aktywności
+        active_users = sum(1 for user_data in data.values() if user_data.get('points', 0) > 0)
+        total_battles = sum(user_data.get('battle_wins', 0) for user_data in data.values())
+
+        # Statystyki mining
+        miners = sum(1 for user_data in data.values() if user_data.get('mining_level', 1) > 1)
+        avg_mining_level = sum(user_data.get('mining_level', 1) for user_data in data.values()) / max(total_users, 1)
+
+        # Statystyki mafii
+        mafia_members = sum(1 for user_data in data.values() if user_data.get('mafia_respect', 0) > 0)
+        dons = sum(1 for user_data in data.values() if get_mafia_rank(user_data.get('mafia_respect', 0)) == 'Don')
+        total_contracts = sum(user_data.get('contracts_completed', 0) for user_data in data.values())
+
+        # Najlepszy gracz
+        if data:
+            top_player = max(data.items(), key=lambda x: x[1].get('points', 0))
+            top_points = top_player[1].get('points', 0)
+        else:
+            top_points = 0
+
+        # Statystyki odznak
+        all_badges = []
+        for user_data in data.values():
+            all_badges.extend(user_data.get('badges', []))
+        unique_badges = len(set(all_badges))
+        total_badges = len(all_badges)
+
+        stats_text = (
+            "📊 **STATYSTYKI MEGA BOTA DON MLEKO:**\n\n"
+            f"👥 **UŻYTKOWNICY:**\n"
+            f"• Łącznie użytkowników: {total_users}\n"
+            f"• Aktywni użytkownicy: {active_users}\n"
+            f"• Najwyższy wynik: {top_points:,}\n\n"
+            f"💎 **PUNKTY I AKTYWNOŚĆ:**\n"
+            f"• Łączne punkty: {total_points:,}\n"
+            f"• Średnia punktów/użytkownik: {total_points//max(total_users, 1):,}\n"
+            f"• Łączne bitwy wygrane: {total_battles}\n\n"
+            f"⛏️ **MINING:**\n"
+            f"• Aktywni górnicy: {miners}\n"
+            f"• Średni level mining: {avg_mining_level:.1f}\n\n"
+            f"🤵 **MAFIA:**\n"
+            f"• Członkowie mafii: {mafia_members}\n"
+            f"• Donowie: {dons}\n"
+            f"• Wykonane kontrakty: {total_contracts}\n\n"
+            f"🏅 **ODZNAKI:**\n"
+            f"• Różne odznaki: {unique_badges}/15\n"
+            f"• Łącznie odznak: {total_badges}\n\n"
+            f"🎮 **NOWE FUNCKJE:**\n"
+            f"• 🤵 System mafii z misjami\n"
+            f"• 🎲 4 nowe mini gry\n"
+            f"• 💰 System napadów i haraczy\n"
+            f"• 🏆 Rangi mafijne\n\n"
+            f"🐄 Mega bot działa 24/7 dla rodziny!"
+        )
+
+        await update.message.reply_text(stats_text, parse_mode='Markdown')
+    except Exception as e:
+        logging.error(f"Błąd w bot_stats: {e}")
+        await update.message.reply_text("❌ Błąd przy pobieraniu statystyk bota!")
+
+async def random_responses(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.effective_user.id
+
+        # Sprawdź rate limiting
+        can_proceed, message = check_rate_limit(user_id, "response")
+        if not can_proceed:
+            # Nie odpowiadaj na każdą wiadomość jeśli przekroczono limit
+            return
+
+        message_text = update.message.text.lower()
+
+        responses = {
+            "siema": "🐄 Siema! Don Mleko pozdrawia!",
+            "hej": "👋 Hej! Jak leci z DMT?",
+            "cześć": "🐄 Cześć członku rodziny!",
+            "moon": "🌙 Don Mleko już pakuje bagaże!",
+            "diamond hands": "💎✋ DIAMOND HANDS FOREVER!",
+            "paper hands": "📄✋ Pfff... Don Mleko nie aprobuje!",
+            "mafia": "🤵 Rozmawiasz z rodziną...",
+            "boss": "👑 Don Mleko jest jedynym bossem!",
+            "napad": "💰 Czas na akcję!",
+            "blackjack": "🃏 Czujesz się szczęśliwy?",
+            "kości": "🎲 Czas na los!",
+            "crash": "🚀 Do gwiazd!"
+        }
+
+        for keyword, response in responses.items():
+            if keyword in message_text:
+                points, success = add_points_with_limit(user_id, 1)
+                if success:
+                    await update.message.reply_text(f"{response}\n💎 +1 punkt! Masz: {points}")
+                else:
+                    await update.message.reply_text(f"{response}\n⚠️ Limit punktów osiągnięty! Masz: {points}")
+                break
+    except Exception as e:
+        logging.error(f"Błąd w responses: {e}")
+        await update.message.reply_text("🐄 Don Mleko ma problem z odpowiedziami!")
+
+# === ERROR HANDLER ===
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ultraodporny error handler - nigdy nie zatrzymuje bota"""
+    try:
+        error = context.error
+        error_type = type(error).__name__
+        error_str = str(error).lower()
+
+        # Lista błędów które są normalne i nie wymagają akcji
+        ignored_errors = [
+            'networkerror', 'readerror', 'connecterror', 'timeouterror', 'httperror',
+            'sslerror', 'connectionerror', 'retryafter', 'forbidden', 'unauthorized',
+            'telegramerror', 'invalidtoken', 'chatmigrated', 'badrequest', 'conflicterror',
+            'chatnotfound', 'userisdeactivated', 'userisblocked', 'botblocked'
+        ]
+
+        # Jeśli błąd jest ignorowany - ciche logowanie
+        if any(ignored in error_str for ignored in ignored_errors):
+            if random.randint(1, 10) == 1:  # Loguj tylko co 10-ty błąd
+                logging.info(f"💚 Normalna operacja: {error_type}")
+            return
+
+        # Błędy związane z użytkownikiem - nie zatrzymuj bota
+        if update and hasattr(update, 'effective_user'):
+            logging.info(f"👤 User error ({error_type}) - kontynuuję")
+            return
+
+        # Inne błędy - loguj ale nie zatrzymuj
+        logging.warning(f"⚠️ {error_type} - bot kontynuuje pracę")
+
+    except Exception as handler_error:
+        # Nawet jeśli error handler ma błąd - nie zatrzymuj bota
+        logging.warning(f"Error handler issue: {handler_error} - ignoruję i kontynuuję")
+        pass
+
+# === STABILNY BOT RUNNER ===
+async def run_bot(app):
+    """Uruchamia bota z auto-restart i backoff"""
+    backoff = 1
+    while True:
+        try:
+            logging.info("🚀 Starting polling...")
+            await app.initialize()
+            await app.start()
+            await app.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,
+                timeout=30,
+                poll_interval=1.0
+            )
+            # Czekaj w nieskończonej pętli dopóki bot nie zostanie zatrzymany
+            while app.updater.running:
+                await asyncio.sleep(1)
+
+        except (NetworkError, TimedOut) as e:
+            logging.warning(f"🔄 Polling error: {e}. Retry in {backoff}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+
+        except Exception as e:
+            logging.exception(f"💀 Fatal error, restarting in 10s: {e}")
+            await asyncio.sleep(10)
+            backoff = 1
+
+        finally:
+            try:
+                await app.updater.stop()
+            except:
+                pass
+            try:
+                await app.stop()
+            except:
+                pass
+            try:
+                await app.shutdown()
+            except:
+                pass
+
+# Główna funkcja async
+async def main():
+    """Główna funkcja bota"""
+    try:
+        # Skonfiguruj sesję aiohttp
+        async def post_init(app):
+            app.bot_data["session"] = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=60, connect=10)
+            )
+
+        async def post_shutdown(app):
+            session = app.bot_data.get("session")
+            if session and not session.closed:
+                await session.close()
+
+        # Zbuduj aplikację
+        app = (
+            ApplicationBuilder()
+            .token(TOKEN)
+            .post_init(post_init)
+            .post_shutdown(post_shutdown)
+            .build()
+        )
+
+        # Dodaj error handler
+        app.add_error_handler(error_handler)
+
+        # Dodaj handlery komend
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("kurs", kurs))
+        app.add_handler(CommandHandler("mem", mem))
+        app.add_handler(CommandHandler("battle", battle))
+        app.add_handler(CommandHandler("mine", mine))
+        app.add_handler(CommandHandler("slots", slots))
+        app.add_handler(CommandHandler("roulette", roulette))
+        app.add_handler(CommandHandler("mafia", mafia_menu))
+        app.add_handler(CommandHandler("missions", missions))
+        app.add_handler(CommandHandler("heist", heist))
+        app.add_handler(CommandHandler("territory", territory))
+        app.add_handler(CommandHandler("protection", protection))
+        app.add_handler(CommandHandler("recruit", recruit_member))
+        app.add_handler(CommandHandler("chat", chat_system))
+        app.add_handler(CommandHandler("bosses", show_bosses))
+        app.add_handler(CommandHandler("city", city_overview))
+        app.add_handler(CommandHandler("buildings", special_buildings))
+        app.add_handler(CommandHandler("mining", advanced_mining))
+        app.add_handler(CommandHandler("blackjack", blackjack))
+        app.add_handler(CommandHandler("dice", dice_game))
+        app.add_handler(CommandHandler("crash", crash_game))
+        app.add_handler(CommandHandler("wheel", wheel_of_fortune))
+        app.add_handler(CommandHandler("feed", social_feed))
+        app.add_handler(CommandHandler("post", create_post))
+        app.add_handler(CommandHandler("like", like_post))
+        app.add_handler(CommandHandler("comment", comment_post))
+        app.add_handler(CommandHandler("c", comment_post))  # Skrócona wersja
+        app.add_handler(CommandHandler("read", read_post))
+        app.add_handler(CommandHandler("myposts", my_posts))
+        app.add_handler(CommandHandler("lottery", super_lottery))
+        app.add_handler(CommandHandler("timetravel", time_travel))
+        app.add_handler(CommandHandler("megaboost", mega_boost))
+        app.add_handler(CommandHandler("godmode", god_mode))
+        app.add_handler(CommandHandler("guild", guild_system))
+        app.add_handler(CallbackQueryHandler(button_callback))
+        app.add_handler(CommandHandler("help", help_command))
+        app.add_handler(CommandHandler("punkty", punkty))
+        app.add_handler(CommandHandler("stats", stats))
+        app.add_handler(CommandHandler("ranking", ranking))
+        app.add_handler(CommandHandler("botstats", bot_stats))
+        app.add_handler(CommandHandler("admin", admin_stats))
+
+        # NOWE KOMENDY Z HISTORII
+        app.add_handler(CommandHandler("historia", historia_don_mleko))
+        app.add_handler(CommandHandler("rogacz", historia_bialego_rogacza))
+        app.add_handler(CommandHandler("lactosa", masakra_lactosa))
+        app.add_handler(CommandHandler("milo", historia_milo))
+        app.add_handler(CommandHandler("kefir", zdradca_kefir))
+
+        # SYSTEM DAILY REWARDS
+        app.add_handler(CommandHandler("daily", daily_reward))
+
+        # === BLOCKCHAIN COMMANDS ===
+        app.add_handler(CommandHandler("dmtshop", dmt_shop_command))
+        app.add_handler(CommandHandler("dmtbuy", dmt_buy_command))
+        app.add_handler(CommandHandler("linkwallet", link_wallet_command))
+        app.add_handler(CommandHandler("checkpurchases", check_purchases_command))
+        app.add_handler(CommandHandler("blockchain", blockchain_status_command))
+
+
+        logging.info("🐄 Don Mleko MEGA Bot v4.2 - ULTRA STABLE EDITION!")
+        logging.info("✅ Token zabezpieczony w zmiennej środowiskowej")
+        logging.info("🔄 Auto-restart z backoff aktywny")
+        logging.info("🔗 Keep-alive serwer uruchomiony")
+        logging.info("👁️ Watchdog monitoring aktywny")
+        logging.info("💎 Blockchain DMT tracking aktywny")
+        
+        # Uruchom automatyczne sprawdzanie DMT w tle
+        asyncio.create_task(auto_check_dmt_purchases())
+
+        # Uruchom watchdog
+        asyncio.create_task(watchdog())
+
+        # Uruchom bota
+        await run_bot(app)
+
+    except Exception as e:
+        logging.error(f"💀 Critical error in main: {e}")
+        sys.exit(1)
+
+# === BLOCKCHAIN FUNCTIONS ===
+
+def load_wallet_mappings():
+    """Ładuje mapowania portfeli użytkowników"""
+    try:
+        if os.path.exists("wallet_mappings.json"):
+            with open("wallet_mappings.json", 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except:
+        pass
+    return {}
+
+def save_wallet_mappings(mappings):
+    """Zapisuje mapowania portfeli"""
+    try:
+        with open("wallet_mappings.json", 'w', encoding='utf-8') as f:
+            json.dump(mappings, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.error(f"Błąd zapisywania portfeli: {e}")
+
+def is_valid_bsc_address(address):
+    """Sprawdza czy adres BSC jest prawidłowy"""
+    try:
+        return len(address) == 42 and address.startswith('0x') and all(c in '0123456789abcdefABCDEF' for c in address[2:])
+    except:
+        return False
+
+async def dmt_shop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ekskluzywny sklep DMT dla inwestorów"""
+    try:
+        user_id = update.effective_user.id
+        user_data = get_user_data_full(user_id)
+        
+        dmt_balance = user_data.get('dmt_purchases', 0)
+        
+        if dmt_balance == 0:
+            await update.message.reply_text(
+                "💎 **DMT SHOP - EKSKLUZYWNY DOSTĘP**\n\n"
+                "❌ **BRAK DOSTĘPU!**\n\n"
+                "🔗 **Aby uzyskać dostęp:**\n"
+                "1. Połącz portfel BSC: `/linkwallet [adres]`\n"
+                "2. Kup prawdziwy DMT na DEX\n"
+                "3. Otrzymasz automatyczne nagrody\n\n"
+                "💡 **1 kupiony DMT = 10 DMT w grze + dostęp do sklepu!**\n\n"
+                "🔗 **Kup DMT:** https://dexscreener.com/bsc/0x1fAc48db5079567D8769c9f1c16b228DB435C018"
+            )
+            return
+
+        shop_text = (
+            f"💎 **DMT SHOP - EKSKLUZYWNY SKLEP**\n\n"
+            f"💰 **Twoje DMT:** {dmt_balance} DMT\n"
+            f"🏅 **Status:** DMT Investor\n\n"
+            f"🛒 **DOSTĘPNE PRZEDMIOTY:**\n\n"
+            f"1. 🚀 **VIP Boost (24h)** - 50 DMT\n"
+            f"   • x2 wszystkie nagrody na 24h\n"
+            f"   • Złoty username w rankingu\n\n"
+            f"2. 💎 **Diamentowy Status** - 100 DMT\n"
+            f"   • Permanentna odznaka Diamond\n"
+            f"   • +50% do wszystkich nagród\n\n"
+            f"3. 👑 **Don Status (7 dni)** - 200 DMT\n"
+            f"   • Tytuł 'Don' przy nazwie\n"
+            f"   • Dostęp do sekretnych komend\n\n"
+            f"4. 🏗️ **Instant Building** - 300 DMT\n"
+            f"   • Postaw dowolny budynek za darmo\n"
+            f"   • Skip wszystkich wymagań\n\n"
+            f"5. ⚡ **Ultimate Power Pack** - 500 DMT\n"
+            f"   • Wszystkie boosty na 7 dni\n"
+            f"   • Reset wszystkich cooldownów\n\n"
+            f"6. 🌟 **Cosmic Upgrade** - 1000 DMT\n"
+            f"   • +100 mining levels\n"
+            f"   • +10,000 respect\n"
+            f"   • God Mode na 24h\n\n"
+            f"💡 Użyj: `/dmtbuy [numer]` aby kupić"
+        )
+
+        await update.message.reply_text(shop_text, parse_mode='Markdown')
+
+    except Exception as e:
+        logging.error(f"Błąd w dmt_shop_command: {e}")
+        await update.message.reply_text("❌ Błąd w DMT Shop!")
+
+async def dmt_buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Kupowanie w DMT Shop"""
+    try:
+        user_id = update.effective_user.id
+        user_data = get_user_data_full(user_id)
+        
+        dmt_balance = user_data.get('dmt_purchases', 0)
+        
+        if dmt_balance == 0:
+            await update.message.reply_text("❌ Brak dostępu do DMT Shop! Kup prawdziwy DMT najpierw.")
+            return
+
+        if not context.args:
+            await update.message.reply_text("💎 Użycie: `/dmtbuy [numer przedmiotu]`\nSprawdź numery w `/dmtshop`")
+            return
+
+        try:
+            item_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("❌ Numer przedmiotu musi być liczbą!")
+            return
+
+        # Definicja przedmiotów
+        shop_items = {
+            1: {"name": "🚀 VIP Boost (24h)", "cost": 50, "type": "vip_boost"},
+            2: {"name": "💎 Diamentowy Status", "cost": 100, "type": "diamond_status"},
+            3: {"name": "👑 Don Status (7 dni)", "cost": 200, "type": "don_status"},
+            4: {"name": "🏗️ Instant Building", "cost": 300, "type": "instant_building"},
+            5: {"name": "⚡ Ultimate Power Pack", "cost": 500, "type": "power_pack"},
+            6: {"name": "🌟 Cosmic Upgrade", "cost": 1000, "type": "cosmic_upgrade"}
+        }
+
+        if item_id not in shop_items:
+            await update.message.reply_text("❌ Nieprawidłowy numer przedmiotu! Dostępne: 1-6")
+            return
+
+        item = shop_items[item_id]
+        
+        if dmt_balance < item["cost"]:
+            await update.message.reply_text(f"❌ Potrzebujesz {item['cost']} DMT! Masz: {dmt_balance}")
+            return
+
+        # Realizuj zakup
+        user_data['dmt_purchases'] = dmt_balance - item["cost"]
+        
+        # Zastosuj efekty przedmiotu
+        now = time.time()
+        
+        if item["type"] == "vip_boost":
+            user_data['vip_boost_until'] = now + 86400  # 24h
+            effect_text = "🚀 VIP Boost aktywny na 24h! x2 wszystkie nagrody!"
+            
+        elif item["type"] == "diamond_status":
+            if "dmt_diamond" not in user_data.get('badges', []):
+                user_data['badges'] = user_data.get('badges', []) + ["dmt_diamond"]
+            user_data['diamond_status'] = True
+            effect_text = "💎 Diamentowy Status permanentnie aktywny!"
+            
+        elif item["type"] == "don_status":
+            user_data['don_status_until'] = now + 604800  # 7 dni
+            effect_text = "👑 Don Status aktywny na 7 dni!"
+            
+        elif item["type"] == "instant_building":
+            user_data['instant_building_tokens'] = user_data.get('instant_building_tokens', 0) + 1
+            effect_text = "🏗️ Otrzymałeś token na darmowy budynek!"
+            
+        elif item["type"] == "power_pack":
+            user_data['power_pack_until'] = now + 604800  # 7 dni
+            # Reset wszystkich cooldownów
+            for location in MINING_LOCATIONS.keys():
+                user_data[f'last_mine_{location}'] = 0
+            user_data['last_mine'] = 0
+            user_data['last_heist'] = 0
+            user_data['last_mission'] = 0
+            user_data['last_lottery'] = 0
+            effect_text = "⚡ Ultimate Power Pack aktywny na 7 dni! Wszystkie cooldowny zresetowane!"
+            
+        elif item["type"] == "cosmic_upgrade":
+            user_data['mining_level'] = user_data.get('mining_level', 1) + 100
+            user_data['mafia_respect'] = user_data.get('mafia_respect', 0) + 10000
+            user_data['god_mode_until'] = now + 86400  # 24h god mode
+            effect_text = "🌟 Cosmic Upgrade zastosowany! +100 mining levels, +10k respect, God Mode 24h!"
+
+        update_user_data(user_id, user_data)
+
+        await update.message.reply_text(
+            f"✅ **ZAKUP UDANY!**\n\n"
+            f"🛒 Kupiono: {item['name']}\n"
+            f"💸 Koszt: {item['cost']} DMT\n"
+            f"💎 Pozostało DMT: {user_data['dmt_purchases']}\n\n"
+            f"🎁 **EFEKT:**\n"
+            f"{effect_text}\n\n"
+            f"🎉 Dziękujemy za inwestycję w prawdziwy DMT!"
+        )
+
+    except Exception as e:
+        logging.error(f"Błąd w dmt_buy_command: {e}")
+        await update.message.reply_text("❌ Błąd podczas zakupu!")
+
+async def link_wallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Łączenie portfela BSC"""
+    try:
+        user_id = update.effective_user.id
+        
+        if not context.args:
+            await update.message.reply_text(
+                "🔗 **POŁĄCZ PORTFEL BSC**\n\n"
+                "💡 **Instrukcja:**\n"
+                "1. Użyj: `/linkwallet [twój_adres_BSC]`\n"
+                "2. Bot sprawdzi Twoje transakcje DMT\n"
+                "3. Otrzymasz automatyczne nagrody\n\n"
+                "📱 **Przykład:**\n"
+                "`/linkwallet 0x742d35Cc6634C0532925a3b8D3Ac3e9C5B0dC4ae`\n\n"
+                "🎁 **Korzyści:**\n"
+                "• 1 kupiony DMT = 10 DMT w grze\n"
+                "• Dostęp do ekskluzywnego sklepu\n"
+                "• Automatyczne wykrywanie transakcji\n"
+                "• Specjalne odznaki investor\n\n"
+                "🔗 **Kup DMT:** https://dexscreener.com/bsc/0x1fAc48db5079567D8769c9f1c16b228DB435C018"
+            )
+            return
+
+        wallet_address = context.args[0].strip()
+        
+        if not is_valid_bsc_address(wallet_address):
+            await update.message.reply_text("❌ Nieprawidłowy adres BSC! Musi zaczynać się od 0x i mieć 42 znaki.")
+            return
+
+        # Załaduj mapowania portfeli
+        mappings = load_wallet_mappings()
+        
+        # Sprawdź czy adres nie jest już używany
+        for existing_user, existing_wallet in mappings.items():
+            if existing_wallet.lower() == wallet_address.lower() and str(existing_user) != str(user_id):
+                await update.message.reply_text("❌ Ten portfel jest już połączony z innym kontem!")
+                return
+
+        # Dodaj mapping
+        mappings[str(user_id)] = wallet_address
+        save_wallet_mappings(mappings)
+        
+        # Aktualizuj dane użytkownika
+        user_data = get_user_data_full(user_id)
+        user_data['wallet_address'] = wallet_address
+        user_data['wallet_linked_at'] = time.time()
+        update_user_data(user_id, user_data)
+        
+        # Sprawdź istniejące transakcje DMT na blockchain
+        try:
+            new_dmt, transactions = await process_new_dmt_purchases(user_id, wallet_address)
+            
+            if new_dmt > 0:
+                bonus_text = (
+                    f"\n\n🎉 **TRANSAKCJE DMT WYKRYTE!**\n"
+                    f"💎 Znaleziono: {new_dmt:.2f} DMT w grze\n"
+                    f"📊 Transakcji: {len(transactions)}\n"
+                    f"🏅 Odznaka: DMT Investor\n"
+                    f"🛒 Dostęp do ekskluzywnego sklepu odblokowany!"
+                )
+            else:
+                bonus_text = (
+                    f"\n\n💡 **BRAK TRANSAKCJI DMT**\n"
+                    f"🔍 System sprawdził historię transakcji\n"
+                    f"💰 Kup DMT aby otrzymać nagrody w grze\n"
+                    f"🎁 1 prawdziwy DMT = 10 DMT w grze + bonusy!"
+                )
+        except:
+            bonus_text = "\n\n⏳ Sprawdzanie transakcji w tle..."
+
+        await update.message.reply_text(
+            f"✅ **PORTFEL POŁĄCZONY!**\n\n"
+            f"🔗 Adres BSC: {wallet_address[:10]}...{wallet_address[-8:]}\n"
+            f"⏰ Połączono: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"{bonus_text}\n\n"
+            f"🚀 **Co dalej:**\n"
+            f"💎 `/dmtshop` - Zobacz ekskluzywny sklep\n"
+            f"📊 `/checkpurchases` - Sprawdź najnowsze transakcje\n"
+            f"🔗 **Kup prawdziwy DMT:** https://dexscreener.com/bsc/{DMT_CONTRACT}\n\n"
+            f"🔄 **Automatyczne sprawdzanie:** System sprawdza nowe transakcje przy każdym `/checkpurchases`"
+        )
+
+    except Exception as e:
+        logging.error(f"Błąd w link_wallet_command: {e}")
+        await update.message.reply_text("❌ Błąd podczas łączenia portfela!")
+
+async def check_dmt_transactions(wallet_address):
+    """Sprawdza prawdziwe transakcje DMT na BSC blockchain"""
+    try:
+        # BSCScan API endpoint
+        api_url = "https://api.bscscan.com/api"
+        
+        params = {
+            'module': 'account',
+            'action': 'tokentx',
+            'contractaddress': DMT_CONTRACT,
+            'address': wallet_address,
+            'page': 1,
+            'offset': 100,
+            'startblock': 0,
+            'endblock': 99999999,
+            'sort': 'desc'
+        }
+        
+        if BSC_API_KEY:
+            params['apikey'] = BSC_API_KEY
+        
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+            async with session.get(api_url, params=params) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    if data['status'] == '1' and data['result']:
+                        buy_transactions = []
+                        
+                        for tx in data['result']:
+                            # Sprawdź czy to transakcja kupna (to: wallet_address)
+                            if tx['to'].lower() == wallet_address.lower():
+                                amount = float(tx['value']) / (10 ** int(tx['tokenDecimal']))
+                                
+                                buy_transactions.append({
+                                    'hash': tx['hash'],
+                                    'amount': amount,
+                                    'timestamp': int(tx['timeStamp']),
+                                    'block': int(tx['blockNumber'])
+                                })
+                        
+                        return buy_transactions
+        
+        return []
+    
+    except Exception as e:
+        logging.error(f"Błąd sprawdzania transakcji DMT: {e}")
+        return []
+
+def load_processed_transactions():
+    """Ładuje listę już przetworzonych transakcji"""
+    try:
+        if os.path.exists("processed_transactions.json"):
+            with open("processed_transactions.json", 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except:
+        pass
+    return []
+
+def save_processed_transactions(transactions):
+    """Zapisuje listę przetworzonych transakcji"""
+    try:
+        with open("processed_transactions.json", 'w', encoding='utf-8') as f:
+            json.dump(transactions, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.error(f"Błąd zapisywania transakcji: {e}")
+
+async def process_new_dmt_purchases(user_id, wallet_address):
+    """Przetwarza nowe zakupy DMT i dodaje nagrody"""
+    try:
+        # Pobierz transakcje z blockchain
+        transactions = await check_dmt_transactions(wallet_address)
+        
+        if not transactions:
+            return 0, []
+        
+        # Pobierz już przetworzone transakcje
+        processed = load_processed_transactions()
+        processed_hashes = [tx['hash'] for tx in processed]
+        
+        new_transactions = []
+        total_new_dmt = 0
+        
+        for tx in transactions:
+            if tx['hash'] not in processed_hashes:
+                new_transactions.append(tx)
+                total_new_dmt += tx['amount']
+                
+                # Dodaj do przetworzonych
+                processed.append(tx)
+        
+        if new_transactions:
+            # Zapisz nowe przetworzone transakcje
+            save_processed_transactions(processed)
+            
+            # Dodaj nagrody w grze (1 prawdziwy DMT = 10 DMT w grze)
+            game_dmt = total_new_dmt * 10
+            user_data = get_user_data_full(user_id)
+            user_data['dmt_purchases'] = user_data.get('dmt_purchases', 0) + game_dmt
+            
+            # Dodaj odznakę inwestora
+            if "dmt_investor" not in user_data.get('badges', []):
+                user_data['badges'] = user_data.get('badges', []) + ["dmt_investor"]
+            
+            # Bonus punkty w grze
+            bonus_points = int(total_new_dmt * 100)  # 100 punktów za każdy DMT
+            add_points(user_id, bonus_points)
+            
+            update_user_data(user_id, user_data)
+            
+            return game_dmt, new_transactions
+        
+        return 0, []
+    
+    except Exception as e:
+        logging.error(f"Błąd przetwarzania zakupów DMT: {e}")
+        return 0, []
+
+async def check_purchases_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sprawdza zakupy DMT i status blockchain"""
+    try:
+        user_id = update.effective_user.id
+        user_data = get_user_data_full(user_id)
+        
+        wallet = user_data.get('wallet_address', None)
+        
+        if not wallet:
+            await update.message.reply_text(
+                "📊 **STATUS BLOCKCHAIN**\n\n"
+                "❌ **Portfel nie połączony**\n\n"
+                "🔗 Użyj: `/linkwallet [adres]` aby połączyć\n"
+                "💎 DMT w grze: 0\n"
+                "🏅 Status: Brak dostępu do sklepu\n\n"
+                "💡 Połącz portfel aby odblokować nagrody!"
+            )
+            return
+        
+        # Sprawdź nowe transakcje na blockchain
+        new_dmt, new_transactions = await process_new_dmt_purchases(user_id, wallet)
+        
+        # Pobierz zaktualizowane dane
+        user_data = get_user_data_full(user_id)
+        dmt_balance = user_data.get('dmt_purchases', 0)
+        linked_time = user_data.get('wallet_linked_at', time.time())
+        linked_date = datetime.fromtimestamp(linked_time).strftime('%Y-%m-%d %H:%M')
+        
+        status_text = (
+            f"📊 **STATUS BLOCKCHAIN**\n\n"
+            f"✅ **Portfel połączony**\n"
+            f"🔗 Adres: {wallet[:10]}...{wallet[-8:]}\n"
+            f"📅 Połączono: {linked_date}\n\n"
+            f"💎 **DMT w grze:** {dmt_balance:.2f}\n"
+            f"🏅 **Status:** {'DMT Investor' if dmt_balance > 0 else 'Połączony'}\n"
+            f"🛒 **Dostęp do sklepu:** {'✅ TAK' if dmt_balance > 0 else '❌ NIE'}\n\n"
+        )
+        
+        if new_dmt > 0:
+            status_text += (
+                f"🎉 **NOWE ZAKUPY WYKRYTE!**\n"
+                f"🆕 Nowych transakcji: {len(new_transactions)}\n"
+                f"💰 Nowy DMT w grze: +{new_dmt:.2f}\n"
+                f"🎁 Bonus punkty: +{int(new_dmt * 10)}\n\n"
+            )
+            
+            # Pokaż szczegóły transakcji
+            for i, tx in enumerate(new_transactions[:3], 1):  # Pokaż max 3 najnowsze
+                tx_date = datetime.fromtimestamp(tx['timestamp']).strftime('%Y-%m-%d %H:%M')
+                status_text += f"🔸 Transakcja {i}: {tx['amount']:.4f} DMT ({tx_date})\n"
+            
+            if len(new_transactions) > 3:
+                status_text += f"... i {len(new_transactions) - 3} więcej\n"
+            
+            status_text += "\n"
+        
+        status_text += (
+            f"🔄 **Sprawdzenie:** {datetime.now().strftime('%H:%M:%S')}\n"
+            f"🌐 **Sieć:** BSC (Binance Smart Chain)\n"
+            f"💎 **Kontrakt:** {DMT_CONTRACT[:10]}...{DMT_CONTRACT[-8:]}\n\n"
+            f"🚀 **Kup więcej DMT:** https://dexscreener.com/bsc/{DMT_CONTRACT}"
+        )
+
+        await update.message.reply_text(status_text, parse_mode='Markdown')
+
+    except Exception as e:
+        logging.error(f"Błąd w check_purchases_command: {e}")
+        await update.message.reply_text("❌ Błąd podczas sprawdzania zakupów!")
+
+async def blockchain_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Status całego systemu blockchain"""
+    try:
+        # Statystyki blockchain
+        mappings = load_wallet_mappings()
+        data = load_user_data()
+        
+        connected_wallets = len(mappings)
+        investors = sum(1 for user_data in data.values() if user_data.get('dmt_purchases', 0) > 0)
+        total_dmt_in_game = sum(user_data.get('dmt_purchases', 0) for user_data in data.values())
+
+        status_text = (
+            f"🔗 **STATUS BLOCKCHAIN INTEGRATION**\n\n"
+            f"🌐 **BSC Network:** {'✅ Połączono' if w3 and w3.is_connected() else '❌ Błąd połączenia'}\n"
+            f"📊 **Kontrakt DMT:** `{DMT_CONTRACT}`\n"
+            f"💱 **Pair Address:** `{DMT_PAIR_ADDRESS}`\n\n"
+            f"👥 **STATYSTYKI UŻYTKOWNIKÓW:**\n"
+            f"🔗 Połączone portfele: {connected_wallets}\n"
+            f"💎 Aktywni inwestorzy: {investors}\n"
+            f"🎮 Łączne DMT w grze: {total_dmt_in_game}\n\n"
+            f"🎯 **FUNKCJE:**\n"
+            f"✅ Łączenie portfeli BSC\n"
+            f"✅ Wykrywanie transakcji (demo)\n"
+            f"✅ Automatyczne nagrody\n"
+            f"✅ Ekskluzywny sklep DMT\n"
+            f"✅ Specjalne odznaki\n\n"
+            f"💡 **DEMO MODE:** Wszystko działa, czeka na aktivację live mode!"
+        )
+
+        await update.message.reply_text(status_text, parse_mode='Markdown')
+
+    except Exception as e:
+        logging.error(f"Błąd w blockchain_status_command: {e}")
+        await update.message.reply_text("❌ Błąd w statusie blockchain!")
+
+if __name__ == "__main__":
+    # Uruchom keep-alive serwer w osobnym wątku
+    threading.Thread(target=start_keepalive, daemon=True).start()
+
+    # Uruchom główną aplikację
+    asyncio.run(main())
